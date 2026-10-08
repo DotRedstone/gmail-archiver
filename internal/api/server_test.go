@@ -1,6 +1,7 @@
 package api
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -246,5 +248,82 @@ target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
 	}
 	if recExport.Header().Get("Content-Type") != "application/zip" {
 		t.Errorf("expected application/zip, got %s", recExport.Header().Get("Content-Type"))
+	}
+
+	// 11. Verify Web Docs endpoint / and /docs (public access)
+	for _, docPath := range []string{"/", "/docs"} {
+		reqDoc := httptest.NewRequest("GET", docPath, nil)
+		recDoc := httptest.NewRecorder()
+		handler.ServeHTTP(recDoc, reqDoc)
+		if recDoc.Code != http.StatusOK {
+			t.Fatalf("doc endpoint %s returned %d", docPath, recDoc.Code)
+		}
+		if !strings.Contains(recDoc.Header().Get("Content-Type"), "text/html") {
+			t.Fatalf("expected text/html for %s, got %s", docPath, recDoc.Header().Get("Content-Type"))
+		}
+		if !strings.Contains(recDoc.Body.String(), "gmail-archiver") {
+			t.Fatalf("doc body missing title content")
+		}
+	}
+
+	// 12. Verify Scenario 2: Single student submission download via URL token
+	reqSingleStudent := httptest.NewRequest("GET", "/api/assignments/parallel_computing_lab1/submissions/240809010501/download?token=secret-token-123", nil)
+	recSingleStudent := httptest.NewRecorder()
+	handler.ServeHTTP(recSingleStudent, reqSingleStudent)
+	if recSingleStudent.Code != http.StatusOK {
+		t.Fatalf("single student download returned %d: %s", recSingleStudent.Code, recSingleStudent.Body.String())
+	}
+	if !bytes.Equal(recSingleStudent.Body.Bytes(), fileContent) {
+		t.Fatalf("single student downloaded content mismatch")
+	}
+
+	// 13. Verify Scenario 3: Semester all assignments export ZIP via ?api_key= query
+	reqAllExport := httptest.NewRequest("GET", "/api/assignments/export/all?api_key=secret-token-123", nil)
+	recAllExport := httptest.NewRecorder()
+	handler.ServeHTTP(recAllExport, reqAllExport)
+	if recAllExport.Code != http.StatusOK {
+		t.Fatalf("semester export all returned %d: %s", recAllExport.Code, recAllExport.Body.String())
+	}
+	if recAllExport.Header().Get("Content-Type") != "application/zip" {
+		t.Fatalf("expected application/zip, got %s", recAllExport.Header().Get("Content-Type"))
+	}
+
+	// Check zip entries in semester export
+	zipReader, err := zip.NewReader(bytes.NewReader(recAllExport.Body.Bytes()), int64(recAllExport.Body.Len()))
+	if err != nil {
+		t.Fatalf("failed to read semester zip: %v", err)
+	}
+	if len(zipReader.File) != 1 {
+		t.Fatalf("expected 1 file in semester zip, got %d", len(zipReader.File))
+	}
+	if !strings.Contains(zipReader.File[0].Name, "240809010501") {
+		t.Fatalf("expected entry with student ID, got %s", zipReader.File[0].Name)
+	}
+
+	// 14. Verify Scenario 4: Single student all assignments export ZIP
+	reqStudentAll := httptest.NewRequest("GET", "/api/students/240809010501/export?token=secret-token-123", nil)
+	recStudentAll := httptest.NewRecorder()
+	handler.ServeHTTP(recStudentAll, reqStudentAll)
+	if recStudentAll.Code != http.StatusOK {
+		t.Fatalf("student all assignments export returned %d: %s", recStudentAll.Code, recStudentAll.Body.String())
+	}
+	if recStudentAll.Header().Get("Content-Type") != "application/zip" {
+		t.Fatalf("expected application/zip, got %s", recStudentAll.Header().Get("Content-Type"))
+	}
+
+	studentZipReader, err := zip.NewReader(bytes.NewReader(recStudentAll.Body.Bytes()), int64(recStudentAll.Body.Len()))
+	if err != nil {
+		t.Fatalf("failed to read student zip: %v", err)
+	}
+	if len(studentZipReader.File) != 1 {
+		t.Fatalf("expected 1 file in student zip, got %d", len(studentZipReader.File))
+	}
+
+	// 15. Verify invalid token returns 401
+	reqInvalidToken := httptest.NewRequest("GET", "/api/students/240809010501/export?token=wrong-token", nil)
+	recInvalidToken := httptest.NewRecorder()
+	handler.ServeHTTP(recInvalidToken, reqInvalidToken)
+	if recInvalidToken.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong token, got %d", recInvalidToken.Code)
 	}
 }

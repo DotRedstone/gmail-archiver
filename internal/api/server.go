@@ -53,7 +53,9 @@ func (s *Server) Routes() http.Handler {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
-	// Health check (public)
+	// Health check and documentation (public)
+	r.Get("/", s.handleDocs)
+	r.Get("/docs", s.handleDocs)
 	r.Get("/health", s.handleHealth)
 
 	// Protected routes
@@ -69,11 +71,17 @@ func (s *Server) Routes() http.Handler {
 
 		api.Route("/api/assignments", func(as chi.Router) {
 			as.Get("/", s.handleListAssignments)
+			as.Get("/export/all", s.handleSemesterExportZip)
 			as.Get("/{id}/status", s.handleAssignmentStatus)
 			as.Get("/{id}/missing", s.handleAssignmentMissing)
 			as.Get("/{id}/submissions", s.handleAssignmentSubmissions)
+			as.Get("/{id}/submissions/{student_id}/download", s.handleStudentSubmissionDownload)
 			as.Get("/{id}/submissions/{student_id}/history", s.handleStudentSubmissionHistory)
 			as.Get("/{id}/export", s.handleAssignmentExportZip)
+		})
+
+		api.Route("/api/students", func(st chi.Router) {
+			st.Get("/{student_id}/export", s.handleStudentAllAssignmentsExportZip)
 		})
 	})
 
@@ -83,12 +91,23 @@ func (s *Server) Routes() http.Handler {
 // [AuthMiddleware]
 func (s *Server) apiKeyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.cfg.APIKey == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		token := r.Header.Get("X-API-Key")
 		if token == "" {
 			authHeader := r.Header.Get("Authorization")
 			if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
 				token = strings.TrimSpace(authHeader[7:])
 			}
+		}
+		if token == "" {
+			token = r.URL.Query().Get("token")
+		}
+		if token == "" {
+			token = r.URL.Query().Get("api_key")
 		}
 
 		if token == "" || token != s.cfg.APIKey {
@@ -437,8 +456,14 @@ func (s *Server) handleAssignmentExportZip(w http.ResponseWriter, r *http.Reques
 	}
 
 	zipFilename := fmt.Sprintf("%s-submissions.zip", id)
+	if s.rules != nil {
+		if rule, ok := s.rules.GetRule(id); ok && rule.Name != "" {
+			zipFilename = fmt.Sprintf("%s_全员作业.zip", rule.Name)
+		}
+	}
+	encodedFilename := url.PathEscape(zipFilename)
 	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", zipFilename))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q; filename*=UTF-8''%s", zipFilename, encodedFilename))
 
 	zw := zip.NewWriter(w)
 	defer zw.Close()
@@ -464,7 +489,191 @@ func (s *Server) handleAssignmentExportZip(w http.ResponseWriter, r *http.Reques
 			Name:   entryName,
 			Method: zip.Deflate,
 		}
-		header.Flags |= 0x800 // UTF-8 filename flag (EFS: Bit 11 of general purpose flag)
+		header.Flags |= 0x800 // UTF-8 filename flag
+		if statErr == nil {
+			header.SetModTime(fi.ModTime())
+		}
+
+		fw, err := zw.CreateHeader(header)
+		if err != nil {
+			file.Close()
+			continue
+		}
+
+		_, _ = io.Copy(fw, file)
+		file.Close()
+	}
+}
+
+// [StudentSubmissionDownload]
+func (s *Server) handleStudentSubmissionDownload(w http.ResponseWriter, r *http.Request) {
+	assignmentID := chi.URLParam(r, "id")
+	studentID := chi.URLParam(r, "student_id")
+
+	sub, err := s.database.GetLatestSubmissionForStudent(assignmentID, studentID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeJSONError(w, http.StatusNotFound, "submission not found")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "failed to query submission: "+err.Error())
+		return
+	}
+
+	absPath, err := s.storage.ResolveAbsolutePath(sub.StoragePath)
+	if err != nil {
+		writeJSONError(w, http.StatusForbidden, "access denied: invalid storage path")
+		return
+	}
+
+	file, err := os.Open(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSONError(w, http.StatusNotFound, "file not found on disk")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "failed to open file")
+		return
+	}
+	defer file.Close()
+
+	fi, err := file.Stat()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to stat file")
+		return
+	}
+
+	filename := sub.TargetFilename
+	if filename == "" {
+		filename = fmt.Sprintf("%s-%s.zip", sub.StudentID, sub.StudentName)
+	}
+
+	encodedFilename := url.PathEscape(filename)
+	disposition := fmt.Sprintf("attachment; filename=%q; filename*=UTF-8''%s", filename, encodedFilename)
+	w.Header().Set("Content-Disposition", disposition)
+	w.Header().Set("Content-Type", "application/octet-stream")
+
+	http.ServeContent(w, r, filename, fi.ModTime(), file)
+}
+
+// [SemesterExportZip]
+func (s *Server) handleSemesterExportZip(w http.ResponseWriter, r *http.Request) {
+	allSubs, err := s.database.GetAllLatestSubmissions()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to query submissions: "+err.Error())
+		return
+	}
+
+	zipFilename := fmt.Sprintf("整学期全量作业归档_%s.zip", time.Now().Format("20060102"))
+	encodedFilename := url.PathEscape(zipFilename)
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q; filename*=UTF-8''%s", zipFilename, encodedFilename))
+
+	zw := zip.NewWriter(w)
+	defer zw.Close()
+
+	for _, sub := range allSubs {
+		absPath, err := s.storage.ResolveAbsolutePath(sub.StoragePath)
+		if err != nil {
+			continue
+		}
+
+		file, err := os.Open(absPath)
+		if err != nil {
+			continue
+		}
+
+		dirName := sub.AssignmentID
+		if s.rules != nil {
+			if rule, ok := s.rules.GetRule(sub.AssignmentID); ok && rule.Name != "" {
+				dirName = rule.Name
+			}
+		}
+		dirName = strings.ReplaceAll(dirName, "/", "_")
+
+		entryName := sub.TargetFilename
+		if entryName == "" {
+			entryName = fmt.Sprintf("%s-%s.zip", sub.StudentID, sub.StudentName)
+		}
+
+		fullEntryPath := fmt.Sprintf("%s/%s", dirName, entryName)
+
+		fi, statErr := file.Stat()
+		header := &zip.FileHeader{
+			Name:   fullEntryPath,
+			Method: zip.Deflate,
+		}
+		header.Flags |= 0x800 // UTF-8 filename flag
+		if statErr == nil {
+			header.SetModTime(fi.ModTime())
+		}
+
+		fw, err := zw.CreateHeader(header)
+		if err != nil {
+			file.Close()
+			continue
+		}
+
+		_, _ = io.Copy(fw, file)
+		file.Close()
+	}
+}
+
+// [StudentAllAssignmentsExportZip]
+func (s *Server) handleStudentAllAssignmentsExportZip(w http.ResponseWriter, r *http.Request) {
+	studentID := chi.URLParam(r, "student_id")
+	subs, err := s.database.GetAllLatestSubmissionsForStudent(studentID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to query submissions: "+err.Error())
+		return
+	}
+
+	if len(subs) == 0 {
+		writeJSONError(w, http.StatusNotFound, "no submissions found for student")
+		return
+	}
+
+	studentName := subs[0].StudentName
+	if studentName == "" {
+		studentName = studentID
+	}
+
+	zipFilename := fmt.Sprintf("%s_%s_全部作业.zip", studentID, studentName)
+	encodedFilename := url.PathEscape(zipFilename)
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q; filename*=UTF-8''%s", zipFilename, encodedFilename))
+
+	zw := zip.NewWriter(w)
+	defer zw.Close()
+
+	seenNames := make(map[string]int)
+	for _, sub := range subs {
+		absPath, err := s.storage.ResolveAbsolutePath(sub.StoragePath)
+		if err != nil {
+			continue
+		}
+
+		file, err := os.Open(absPath)
+		if err != nil {
+			continue
+		}
+
+		entryName := sub.TargetFilename
+		if entryName == "" {
+			entryName = fmt.Sprintf("%s_%s_%s.zip", sub.AssignmentID, sub.StudentID, sub.StudentName)
+		}
+
+		if seenNames[entryName] > 0 {
+			entryName = fmt.Sprintf("%s_%s", sub.AssignmentID, entryName)
+		}
+		seenNames[entryName]++
+
+		fi, statErr := file.Stat()
+		header := &zip.FileHeader{
+			Name:   entryName,
+			Method: zip.Deflate,
+		}
+		header.Flags |= 0x800 // UTF-8 filename flag
 		if statErr == nil {
 			header.SetModTime(fi.ModTime())
 		}

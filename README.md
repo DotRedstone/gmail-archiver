@@ -159,17 +159,63 @@ target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
 
 ---
 
-## 常用操作与实战 API
+## 在线接口文档与实战 API
 
-### 1. 监控服务与实时同步状态
+### 1. 在线接口文档与下载控制台 (Web UI)
+
+服务内置了交互式 Web 接口文档与导出控制台，**直接在浏览器中访问根路径即可查看**：
+- 🌐 访问地址：`http://localhost:8080/` 或 `http://localhost:8080/docs`
+- 🔑 **动态 Token 注入**：控制台顶部提供 Token 调试栏，填入 Token 后，页面内所有**一键下载按钮**与 cURL 命令均会自动拼接鉴权参数，方便老师或助教在浏览器中一键点击直链下载。
+
+---
+
+### 2. Token 权限鉴权（支持浏览器直链点击）
+
+若启动时通过 `-api-key "your_secret_token"` 或环境变量 `API_KEY` 配置了权限令牌，系统支持以下**任意一种**方式鉴权：
+
+1. **URL Query 参数（推荐浏览器点击直链或微信/QQ发送）**：
+   - `?token=your_secret_token`
+   - 或 `?api_key=your_secret_token`
+2. **HTTP Header**：
+   - `X-API-Key: your_secret_token`
+3. **Bearer Token**：
+   - `Authorization: Bearer your_secret_token`
+
+---
+
+### 3. 多维作业下载与打包（覆盖高校教学 4 大典型场景）
+
+#### 场景 1：单次作业全员打包 (Zip)
+一次性下载某一次作业（如实验1）的全班学生最新有效作业，自动规范重命名并打包为一个 Zip：
 ```bash
-curl -s http://localhost:8080/health | jq .
+curl -s "http://localhost:8080/api/assignments/parallel_computing_lab1/export?token=your_token" -o 并行计算实验1_全员作业.zip
 ```
-返回中 `imap.state` 为 `"idle"` 即表示服务正处于毫秒级长连接监听状态。
 
-### 2. 查看作业整体进度（应交/实交/提交率）
+#### 场景 2：单次作业指定学生单独下载
+单人复查某次作业时，直接下载该学生提交的最新文件（以规范文件名流式下载）：
 ```bash
-curl -s http://localhost:8080/api/assignments/parallel_computing_lab1/status | jq .
+curl -s "http://localhost:8080/api/assignments/parallel_computing_lab1/submissions/240809010501/download?token=your_token" -O
+```
+
+#### 场景 3：整学期全部作业全员总打包 (Zip)
+一键打包下载截止目前所有已开设作业（实验1、实验2、实验3...）的全部学生有效文件，按作业目录自动分类打包为一个 Zip：
+```bash
+curl -s "http://localhost:8080/api/assignments/export/all?token=your_token" -o 整学期全量作业归档.zip
+```
+
+#### 场景 4：单人纵向全学期所有作业总打包 (Zip)
+期末复查某位学生平时成绩时，纵向提取该学生截止目前提交的全部课程作业，打包为 `{学号}_{姓名}_全部作业.zip`：
+```bash
+curl -s "http://localhost:8080/api/students/240809010501/export?token=your_token" -o 240809010501_支全振_全部作业.zip
+```
+
+---
+
+### 4. 统计分析与催收 API
+
+#### 查看作业整体进度（应交/实交/提交率）
+```bash
+curl -s "http://localhost:8080/api/assignments/parallel_computing_lab1/status?token=your_token" | jq .
 ```
 **输出示例**：
 ```json
@@ -185,30 +231,21 @@ curl -s http://localhost:8080/api/assignments/parallel_computing_lab1/status | j
 }
 ```
 
-### 3. 一键提取未交名单（催交神器）
+#### 一键提取未交名单（催交神器）
 ```bash
 # 获取未交完整 JSON
-curl -s http://localhost:8080/api/assignments/parallel_computing_lab1/missing | jq .
+curl -s "http://localhost:8080/api/assignments/parallel_computing_lab1/missing?token=your_token" | jq .
 
-# 单行提取未交学生姓名，直接复制发到 QQ 微信群
-curl -s http://localhost:8080/api/assignments/parallel_computing_lab1/missing | \
+# 单行提取未交学生姓名与学号，直接复制发到 QQ/微信群催交
+curl -s "http://localhost:8080/api/assignments/parallel_computing_lab1/missing?token=your_token" | \
   jq -r '.missing_list[] | "\(.name) (\(.student_id))"'
 ```
 
-### 4. 查看单个学生提交历史（版本更正核验）
+#### 查看单个学生提交历史（版本更正核验与时间线）
 ```bash
-curl -s http://localhost:8080/api/assignments/parallel_computing_lab1/submissions/240809010501/history | jq .
+curl -s "http://localhost:8080/api/assignments/parallel_computing_lab1/submissions/240809010501/history?token=your_token" | jq .
 ```
 可查看到该学生历次提交的时间、对应文件名及当前唯一有效的版本（`is_latest = true`）。
-
-### 5. 一键打包整班作业
-```bash
-curl -s http://localhost:8080/api/assignments/parallel_computing_lab1/export -o 并行计算实验1_全班作业.zip
-```
-下载的 Zip 文件内：
-- 严格仅包含每位学生的最新版文件；
-- 全部自动重命名为：`实验1-2024级计算机科学与技术5班-240809010501-支全振.zip`；
-- 无任何重复文件、无遗漏。
 
 ---
 

@@ -500,3 +500,99 @@ func (d *DB) GetStudentSubmissionHistory(assignmentID, studentID string) ([]*Sub
 	}
 	return list, nil
 }
+
+// [GetLatestSubmissionForStudent]
+func (d *DB) GetLatestSubmissionForStudent(assignmentID, studentID string) (*Submission, error) {
+	query := `SELECT s.id, s.assignment_id, s.student_id, s.student_name, s.class_name,
+		s.attachment_id, s.submitted_at, s.version, s.is_latest, s.is_late, s.target_filename, s.created_at,
+		a.file_size, a.sha256, a.storage_path
+		FROM submissions s
+		JOIN attachments a ON s.attachment_id = a.id
+		WHERE s.assignment_id = ? AND s.student_id = ? AND s.is_latest = 1
+		LIMIT 1`
+
+	var sub Submission
+	var subAtStr, crAtStr string
+	err := d.conn.QueryRow(query, assignmentID, studentID).Scan(
+		&sub.ID, &sub.AssignmentID, &sub.StudentID, &sub.StudentName, &sub.ClassName,
+		&sub.AttachmentID, &subAtStr, &sub.Version, &sub.IsLatest, &sub.IsLate, &sub.TargetFilename, &crAtStr,
+		&sub.FileSize, &sub.SHA256, &sub.StoragePath,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("db: query student latest submission: %w", err)
+	}
+	sub.SubmittedAt, _ = time.Parse(time.RFC3339, subAtStr)
+	sub.CreatedAt, _ = time.Parse(time.RFC3339, crAtStr)
+	return &sub, nil
+}
+
+// [GetAllLatestSubmissions]
+func (d *DB) GetAllLatestSubmissions() ([]*Submission, error) {
+	query := `SELECT s.id, s.assignment_id, s.student_id, s.student_name, s.class_name,
+		s.attachment_id, s.submitted_at, s.version, s.is_latest, s.is_late, s.target_filename, s.created_at,
+		a.file_size, a.sha256, a.storage_path
+		FROM submissions s
+		JOIN attachments a ON s.attachment_id = a.id
+		WHERE s.is_latest = 1
+		ORDER BY s.assignment_id ASC, s.student_id ASC`
+
+	rows, err := d.conn.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("db: query all latest submissions: %w", err)
+	}
+	defer rows.Close()
+
+	var list []*Submission
+	for rows.Next() {
+		var sub Submission
+		var subAtStr, crAtStr string
+		if err := rows.Scan(
+			&sub.ID, &sub.AssignmentID, &sub.StudentID, &sub.StudentName, &sub.ClassName,
+			&sub.AttachmentID, &subAtStr, &sub.Version, &sub.IsLatest, &sub.IsLate, &sub.TargetFilename, &crAtStr,
+			&sub.FileSize, &sub.SHA256, &sub.StoragePath,
+		); err != nil {
+			return nil, fmt.Errorf("db: scan all latest submissions: %w", err)
+		}
+		sub.SubmittedAt, _ = time.Parse(time.RFC3339, subAtStr)
+		sub.CreatedAt, _ = time.Parse(time.RFC3339, crAtStr)
+		list = append(list, &sub)
+	}
+	return list, nil
+}
+
+// [GetAllLatestSubmissionsForStudent]
+func (d *DB) GetAllLatestSubmissionsForStudent(studentID string) ([]*Submission, error) {
+	query := `SELECT s.id, s.assignment_id, s.student_id, s.student_name, s.class_name,
+		s.attachment_id, s.submitted_at, s.version, s.is_latest, s.is_late, s.target_filename, s.created_at,
+		a.file_size, a.sha256, a.storage_path
+		FROM submissions s
+		JOIN attachments a ON s.attachment_id = a.id
+		WHERE s.student_id = ? AND s.is_latest = 1
+		ORDER BY s.assignment_id ASC`
+
+	rows, err := d.conn.Query(query, studentID)
+	if err != nil {
+		return nil, fmt.Errorf("db: query student all latest submissions: %w", err)
+	}
+	defer rows.Close()
+
+	var list []*Submission
+	for rows.Next() {
+		var sub Submission
+		var subAtStr, crAtStr string
+		if err := rows.Scan(
+			&sub.ID, &sub.AssignmentID, &sub.StudentID, &sub.StudentName, &sub.ClassName,
+			&sub.AttachmentID, &subAtStr, &sub.Version, &sub.IsLatest, &sub.IsLate, &sub.TargetFilename, &crAtStr,
+			&sub.FileSize, &sub.SHA256, &sub.StoragePath,
+		); err != nil {
+			return nil, fmt.Errorf("db: scan student submissions: %w", err)
+		}
+		sub.SubmittedAt, _ = time.Parse(time.RFC3339, subAtStr)
+		sub.CreatedAt, _ = time.Parse(time.RFC3339, crAtStr)
+		list = append(list, &sub)
+	}
+	return list, nil
+}
