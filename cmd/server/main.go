@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/dot/gmail-archiver/internal/db"
 	"github.com/dot/gmail-archiver/internal/imap"
 	"github.com/dot/gmail-archiver/internal/parser"
+	"github.com/dot/gmail-archiver/internal/rule"
 	"github.com/dot/gmail-archiver/internal/storage"
 )
 
@@ -41,7 +44,26 @@ func main() {
 	defer database.Close()
 
 	emailParser := parser.New(storageEngine)
-	watcher := imap.NewWatcher(cfg, database, emailParser)
+
+	// Load assignment rules
+	ruleEngine := rule.NewEngine(cfg.DataDir)
+	if entries, err := os.ReadDir(cfg.RulesDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() && (strings.HasSuffix(entry.Name(), ".yaml") || strings.HasSuffix(entry.Name(), ".yml")) {
+				rulePath := filepath.Join(cfg.RulesDir, entry.Name())
+				r, loadErr := ruleEngine.LoadRuleFile(rulePath)
+				if loadErr != nil {
+					log.Printf("[server] failed to load rule %s: %v", rulePath, loadErr)
+				} else {
+					log.Printf("[server] loaded assignment rule %q (%s, %d enrolled students)", r.ID, r.Name, r.Roster.Count())
+				}
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		log.Printf("[server] scan rules dir %s: %v", cfg.RulesDir, err)
+	}
+
+	watcher := imap.NewWatcher(cfg, database, emailParser, ruleEngine)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -50,7 +72,7 @@ func main() {
 	go watcher.Start(ctx)
 
 	// Setup HTTP server
-	apiServer := api.NewServer(cfg, database, storageEngine, watcher)
+	apiServer := api.NewServer(cfg, database, storageEngine, watcher, ruleEngine)
 	httpServer := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler:           apiServer.Routes(),

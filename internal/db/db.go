@@ -32,6 +32,26 @@ type Attachment struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+type Submission struct {
+	ID             int64     `json:"id"`
+	AssignmentID   string    `json:"assignment_id"`
+	StudentID      string    `json:"student_id"`
+	StudentName    string    `json:"student_name"`
+	ClassName      string    `json:"class_name"`
+	AttachmentID   int64     `json:"attachment_id"`
+	SubmittedAt    time.Time `json:"submitted_at"`
+	Version        int       `json:"version"`
+	IsLatest       bool      `json:"is_latest"`
+	IsLate         bool      `json:"is_late"`
+	TargetFilename string    `json:"target_filename"`
+	CreatedAt      time.Time `json:"created_at"`
+
+	// Joined attachment fields
+	FileSize    int64  `json:"file_size,omitempty"`
+	SHA256      string `json:"sha256,omitempty"`
+	StoragePath string `json:"storage_path,omitempty"`
+}
+
 // [Filter]
 type AttachmentFilter struct {
 	Keyword  string
@@ -101,6 +121,23 @@ func (d *DB) migrate() error {
 			val TEXT NOT NULL,
 			updated_at DATETIME NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS submissions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			assignment_id TEXT NOT NULL,
+			student_id TEXT NOT NULL,
+			student_name TEXT NOT NULL,
+			class_name TEXT NOT NULL,
+			attachment_id INTEGER NOT NULL,
+			submitted_at DATETIME NOT NULL,
+			version INTEGER NOT NULL DEFAULT 1,
+			is_latest BOOLEAN NOT NULL DEFAULT 1,
+			is_late BOOLEAN NOT NULL DEFAULT 0,
+			target_filename TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			FOREIGN KEY(attachment_id) REFERENCES attachments(id)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_submissions_lookup ON submissions(assignment_id, student_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_submissions_latest ON submissions(assignment_id, is_latest);`,
 	}
 
 	for _, q := range queries {
@@ -315,4 +352,146 @@ func (d *DB) SetLastSyncedUID(mailbox string, uid uint32) error {
 		return fmt.Errorf("db: set sync state: %w", err)
 	}
 	return nil
+}
+
+// [RecordSubmission]
+func (d *DB) RecordSubmission(sub *Submission) (version int, isUpdate bool, err error) {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return 0, false, fmt.Errorf("db: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var maxVer sql.NullInt64
+	err = tx.QueryRow(
+		`SELECT MAX(version) FROM submissions WHERE assignment_id = ? AND student_id = ?`,
+		sub.AssignmentID, sub.StudentID,
+	).Scan(&maxVer)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, fmt.Errorf("db: query max version: %w", err)
+	}
+
+	newVersion := 1
+	if maxVer.Valid && maxVer.Int64 > 0 {
+		newVersion = int(maxVer.Int64) + 1
+		isUpdate = true
+
+		_, err = tx.Exec(
+			`UPDATE submissions SET is_latest = 0 WHERE assignment_id = ? AND student_id = ?`,
+			sub.AssignmentID, sub.StudentID,
+		)
+		if err != nil {
+			return 0, false, fmt.Errorf("db: update previous submissions: %w", err)
+		}
+	}
+
+	now := time.Now().UTC()
+	if sub.CreatedAt.IsZero() {
+		sub.CreatedAt = now
+	}
+	sub.Version = newVersion
+	sub.IsLatest = true
+
+	insertQuery := `INSERT INTO submissions (
+		assignment_id, student_id, student_name, class_name, attachment_id,
+		submitted_at, version, is_latest, is_late, target_filename, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+	res, err := tx.Exec(
+		insertQuery,
+		sub.AssignmentID,
+		sub.StudentID,
+		sub.StudentName,
+		sub.ClassName,
+		sub.AttachmentID,
+		sub.SubmittedAt.UTC().Format(time.RFC3339),
+		sub.Version,
+		sub.IsLatest,
+		sub.IsLate,
+		sub.TargetFilename,
+		sub.CreatedAt.UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		return 0, false, fmt.Errorf("db: insert submission: %w", err)
+	}
+
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, false, err
+	}
+	sub.ID = id
+
+	if err := tx.Commit(); err != nil {
+		return 0, false, fmt.Errorf("db: commit tx: %w", err)
+	}
+
+	return newVersion, isUpdate, nil
+}
+
+// [GetLatestSubmissions]
+func (d *DB) GetLatestSubmissions(assignmentID string) ([]*Submission, error) {
+	query := `SELECT s.id, s.assignment_id, s.student_id, s.student_name, s.class_name,
+		s.attachment_id, s.submitted_at, s.version, s.is_latest, s.is_late, s.target_filename, s.created_at,
+		a.file_size, a.sha256, a.storage_path
+		FROM submissions s
+		JOIN attachments a ON s.attachment_id = a.id
+		WHERE s.assignment_id = ? AND s.is_latest = 1
+		ORDER BY s.student_id ASC`
+
+	rows, err := d.conn.Query(query, assignmentID)
+	if err != nil {
+		return nil, fmt.Errorf("db: query latest submissions: %w", err)
+	}
+	defer rows.Close()
+
+	var list []*Submission
+	for rows.Next() {
+		var sub Submission
+		var subAtStr, crAtStr string
+		if err := rows.Scan(
+			&sub.ID, &sub.AssignmentID, &sub.StudentID, &sub.StudentName, &sub.ClassName,
+			&sub.AttachmentID, &subAtStr, &sub.Version, &sub.IsLatest, &sub.IsLate, &sub.TargetFilename, &crAtStr,
+			&sub.FileSize, &sub.SHA256, &sub.StoragePath,
+		); err != nil {
+			return nil, fmt.Errorf("db: scan submission: %w", err)
+		}
+		sub.SubmittedAt, _ = time.Parse(time.RFC3339, subAtStr)
+		sub.CreatedAt, _ = time.Parse(time.RFC3339, crAtStr)
+		list = append(list, &sub)
+	}
+	return list, nil
+}
+
+// [GetStudentSubmissionHistory]
+func (d *DB) GetStudentSubmissionHistory(assignmentID, studentID string) ([]*Submission, error) {
+	query := `SELECT s.id, s.assignment_id, s.student_id, s.student_name, s.class_name,
+		s.attachment_id, s.submitted_at, s.version, s.is_latest, s.is_late, s.target_filename, s.created_at,
+		a.file_size, a.sha256, a.storage_path
+		FROM submissions s
+		JOIN attachments a ON s.attachment_id = a.id
+		WHERE s.assignment_id = ? AND s.student_id = ?
+		ORDER BY s.version DESC`
+
+	rows, err := d.conn.Query(query, assignmentID, studentID)
+	if err != nil {
+		return nil, fmt.Errorf("db: query student history: %w", err)
+	}
+	defer rows.Close()
+
+	var list []*Submission
+	for rows.Next() {
+		var sub Submission
+		var subAtStr, crAtStr string
+		if err := rows.Scan(
+			&sub.ID, &sub.AssignmentID, &sub.StudentID, &sub.StudentName, &sub.ClassName,
+			&sub.AttachmentID, &subAtStr, &sub.Version, &sub.IsLatest, &sub.IsLate, &sub.TargetFilename, &crAtStr,
+			&sub.FileSize, &sub.SHA256, &sub.StoragePath,
+		); err != nil {
+			return nil, fmt.Errorf("db: scan history: %w", err)
+		}
+		sub.SubmittedAt, _ = time.Parse(time.RFC3339, subAtStr)
+		sub.CreatedAt, _ = time.Parse(time.RFC3339, crAtStr)
+		list = append(list, &sub)
+	}
+	return list, nil
 }

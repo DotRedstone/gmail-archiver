@@ -17,6 +17,7 @@ import (
 	"github.com/dot/gmail-archiver/internal/config"
 	"github.com/dot/gmail-archiver/internal/db"
 	"github.com/dot/gmail-archiver/internal/parser"
+	"github.com/dot/gmail-archiver/internal/rule"
 	goimap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 )
@@ -36,16 +37,18 @@ type Watcher struct {
 	cfg    *config.Config
 	db     *db.DB
 	parser *parser.Parser
+	rules  *rule.Engine
 
 	mu     sync.RWMutex
 	status Status
 }
 
-func NewWatcher(cfg *config.Config, database *db.DB, emailParser *parser.Parser) *Watcher {
+func NewWatcher(cfg *config.Config, database *db.DB, emailParser *parser.Parser, ruleEngine *rule.Engine) *Watcher {
 	return &Watcher{
 		cfg:    cfg,
 		db:     database,
 		parser: emailParser,
+		rules:  ruleEngine,
 		status: Status{
 			State:   "disconnected",
 			Mailbox: "INBOX",
@@ -325,6 +328,29 @@ func (w *Watcher) fetchAndArchive(client *imapclient.Client, uid goimap.UID) err
 		}
 		savedCount++
 		log.Printf("[imap] archived attachment id=%d filename=%q size=%d bytes", id, att.Filename, att.FileSize)
+
+		// Assignment rule matching & overwrite update mechanism
+		if w.rules != nil {
+			if _, matchRes, ok := w.rules.Match(meta.Subject, att.Filename, meta.BodyText, meta.ReceivedAt); ok {
+				sub := &db.Submission{
+					AssignmentID:   matchRes.AssignmentID,
+					StudentID:      matchRes.StudentID,
+					StudentName:    matchRes.StudentName,
+					ClassName:      matchRes.ClassName,
+					AttachmentID:   id,
+					SubmittedAt:    meta.ReceivedAt,
+					IsLate:         matchRes.IsLate,
+					TargetFilename: matchRes.TargetFilename,
+				}
+				ver, isUpdate, subErr := w.db.RecordSubmission(sub)
+				if subErr != nil {
+					log.Printf("[imap] record submission error for student %s: %v", matchRes.StudentID, subErr)
+				} else {
+					log.Printf("[imap] assignment %s recorded: student %s (%s) v%d [update=%v, late=%v]",
+						matchRes.AssignmentID, matchRes.StudentID, matchRes.StudentName, ver, isUpdate, matchRes.IsLate)
+				}
+			}
+		}
 	}
 
 	w.updateStatus(func(s *Status) {

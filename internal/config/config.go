@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ type Config struct {
 	IMAPUser            string
 	IMAPPassword        string
 	DataDir             string
+	RulesDir            string
 	HTTPPort            int
 	APIKey              string
 	IdleRefreshInterval time.Duration
@@ -48,6 +50,9 @@ func Load() (*Config, error) {
 			cfg.HTTPPort = port
 		}
 	}
+	if v := os.Getenv("RULES_DIR"); v != "" {
+		cfg.RulesDir = v
+	}
 	if v := os.Getenv("API_KEY"); v != "" {
 		cfg.APIKey = v
 	}
@@ -59,6 +64,7 @@ func Load() (*Config, error) {
 		imapUser     = fs.String("imap-user", cfg.IMAPUser, "IMAP username or email")
 		imapPassword = fs.String("imap-password", cfg.IMAPPassword, "IMAP app password")
 		dataDir      = fs.String("data-dir", cfg.DataDir, "Data storage directory")
+		rulesDir     = fs.String("rules-dir", cfg.RulesDir, "Assignment rules directory (default: <data-dir>/rules)")
 		httpPort     = fs.Int("http-port", cfg.HTTPPort, "HTTP server listening port")
 		apiKey       = fs.String("api-key", cfg.APIKey, "API key for authentication (optional)")
 	)
@@ -71,6 +77,10 @@ func Load() (*Config, error) {
 	cfg.IMAPUser = strings.TrimSpace(*imapUser)
 	cfg.IMAPPassword = strings.TrimSpace(*imapPassword)
 	cfg.DataDir = strings.TrimSpace(*dataDir)
+	cfg.RulesDir = strings.TrimSpace(*rulesDir)
+	if cfg.RulesDir == "" {
+		cfg.RulesDir = filepath.Join(cfg.DataDir, "rules")
+	}
 	cfg.HTTPPort = *httpPort
 	cfg.APIKey = strings.TrimSpace(*apiKey)
 

@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/dot/gmail-archiver/internal/config"
 	"github.com/dot/gmail-archiver/internal/db"
+	"github.com/dot/gmail-archiver/internal/rule"
 	"github.com/dot/gmail-archiver/internal/storage"
 )
 
@@ -40,7 +42,27 @@ func TestAPIServer(t *testing.T) {
 		APIKey:   "secret-token-123",
 	}
 
-	srv := NewServer(cfg, database, storageEngine, nil)
+	// Setup roster and rule for assignment tests
+	csvContent := `学号,性别,姓名,班级
+240809010501,男,支全振,2024级计算机科学与技术5班
+240809010502,男,马祥宇,2024级计算机科学与技术5班
+`
+	_ = os.WriteFile(filepath.Join(tmpDir, "roster.csv"), []byte(csvContent), 0o644)
+	yamlContent := `id: "parallel_computing_lab1"
+name: "并行计算实验1"
+deadline: "2026-09-23T18:00:00+08:00"
+rosters:
+  - "roster.csv"
+patterns:
+  subject_regex: "^并行计算-实验1-(?P<name>[\\p{Han}\\w]+)$"
+  attachment_regex: "^实验1-(?P<class>[\\w\\p{Han}]+)-(?P<student_id>\\d{12})-(?P<name>[\\p{Han}\\w]+)\\.(?P<ext>zip|rar|7z|tar\\.gz)$"
+target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
+`
+	_ = os.WriteFile(filepath.Join(tmpDir, "rule.yaml"), []byte(yamlContent), 0o644)
+	ruleEngine := rule.NewEngine(tmpDir)
+	_, _ = ruleEngine.LoadRuleFile("rule.yaml")
+
+	srv := NewServer(cfg, database, storageEngine, nil, ruleEngine)
 	handler := srv.Routes()
 
 	// 1. Health check should be accessible without auth
@@ -126,5 +148,103 @@ func TestAPIServer(t *testing.T) {
 	dispHeader := recDownload.Header().Get("Content-Disposition")
 	if dispHeader == "" {
 		t.Errorf("missing Content-Disposition header")
+	}
+
+	// 6. Test Assignment submission recording with overwrite mechanism
+	sub1 := &db.Submission{
+		AssignmentID:   "parallel_computing_lab1",
+		StudentID:      "240809010501",
+		StudentName:    "支全振",
+		ClassName:      "2024级计算机科学与技术5班",
+		AttachmentID:   id,
+		SubmittedAt:    now.Add(-2 * time.Hour),
+		TargetFilename: "实验1-241-240809010501-支全振.zip",
+	}
+	_, _, err = database.RecordSubmission(sub1)
+	if err != nil {
+		t.Fatalf("RecordSubmission 1: %v", err)
+	}
+
+	// Student corrects/resubmits assignment
+	sub2 := &db.Submission{
+		AssignmentID:   "parallel_computing_lab1",
+		StudentID:      "240809010501",
+		StudentName:    "支全振",
+		ClassName:      "2024级计算机科学与技术5班",
+		AttachmentID:   id,
+		SubmittedAt:    now.Add(-1 * time.Hour),
+		TargetFilename: "实验1-241-240809010501-支全振.zip",
+	}
+	v2, isUp2, err := database.RecordSubmission(sub2)
+	if err != nil || v2 != 2 || !isUp2 {
+		t.Fatalf("RecordSubmission 2: v=%d, isUp=%v, err=%v", v2, isUp2, err)
+	}
+
+	// 7. Verify /api/assignments/{id}/status
+	reqStatus := httptest.NewRequest("GET", "/api/assignments/parallel_computing_lab1/status", nil)
+	reqStatus.Header.Set("X-API-Key", "secret-token-123")
+	recStatus := httptest.NewRecorder()
+	handler.ServeHTTP(recStatus, reqStatus)
+	if recStatus.Code != http.StatusOK {
+		t.Fatalf("status API returned %d", recStatus.Code)
+	}
+	var statusResp struct {
+		TotalExpected  int    `json:"total_expected"`
+		SubmittedCount int    `json:"submitted_count"`
+		MissingCount   int    `json:"missing_count"`
+		SubmissionRate string `json:"submission_rate"`
+	}
+	_ = json.Unmarshal(recStatus.Body.Bytes(), &statusResp)
+	if statusResp.TotalExpected != 2 || statusResp.SubmittedCount != 1 || statusResp.MissingCount != 1 {
+		t.Errorf("unexpected status stats: %+v", statusResp)
+	}
+
+	// 8. Verify /api/assignments/{id}/missing
+	reqMissing := httptest.NewRequest("GET", "/api/assignments/parallel_computing_lab1/missing", nil)
+	reqMissing.Header.Set("X-API-Key", "secret-token-123")
+	recMissing := httptest.NewRecorder()
+	handler.ServeHTTP(recMissing, reqMissing)
+	if recMissing.Code != http.StatusOK {
+		t.Fatalf("missing API returned %d", recMissing.Code)
+	}
+	var missingResp struct {
+		MissingCount int `json:"missing_count"`
+		MissingList  []struct {
+			StudentID string `json:"student_id"`
+			Name      string `json:"name"`
+		} `json:"missing_list"`
+	}
+	_ = json.Unmarshal(recMissing.Body.Bytes(), &missingResp)
+	if missingResp.MissingCount != 1 || len(missingResp.MissingList) != 1 || missingResp.MissingList[0].StudentID != "240809010502" {
+		t.Errorf("expected missing student 240809010502, got: %+v", missingResp)
+	}
+
+	// 9. Verify /api/assignments/{id}/submissions/{student_id}/history
+	reqHist := httptest.NewRequest("GET", "/api/assignments/parallel_computing_lab1/submissions/240809010501/history", nil)
+	reqHist.Header.Set("X-API-Key", "secret-token-123")
+	recHist := httptest.NewRecorder()
+	handler.ServeHTTP(recHist, reqHist)
+	if recHist.Code != http.StatusOK {
+		t.Fatalf("history API returned %d", recHist.Code)
+	}
+	var histResp struct {
+		TotalVersion int             `json:"total_version"`
+		History      []db.Submission `json:"history"`
+	}
+	_ = json.Unmarshal(recHist.Body.Bytes(), &histResp)
+	if histResp.TotalVersion != 2 || len(histResp.History) != 2 || !histResp.History[0].IsLatest {
+		t.Errorf("expected 2 versions with first being latest, got: %+v", histResp)
+	}
+
+	// 10. Verify /api/assignments/{id}/export (Zip download)
+	reqExport := httptest.NewRequest("GET", "/api/assignments/parallel_computing_lab1/export", nil)
+	reqExport.Header.Set("X-API-Key", "secret-token-123")
+	recExport := httptest.NewRecorder()
+	handler.ServeHTTP(recExport, reqExport)
+	if recExport.Code != http.StatusOK {
+		t.Fatalf("export API returned %d", recExport.Code)
+	}
+	if recExport.Header().Get("Content-Type") != "application/zip" {
+		t.Errorf("expected application/zip, got %s", recExport.Header().Get("Content-Type"))
 	}
 }

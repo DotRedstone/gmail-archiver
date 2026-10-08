@@ -37,6 +37,7 @@ type EmailMetadata struct {
 	Sender      string
 	Subject     string
 	ReceivedAt  time.Time
+	BodyText    string
 	Attachments []*db.Attachment
 }
 
@@ -118,6 +119,9 @@ func (p *Parser) Parse(r io.Reader) (*EmailMetadata, error) {
 				isAttachment = true
 				mimeType = contentType
 				filename = fn
+			} else if strings.EqualFold(contentType, "text/plain") && meta.BodyText == "" {
+				bodyBuf, _ := io.ReadAll(io.LimitReader(part.Body, 32*1024))
+				meta.BodyText = string(bodyBuf)
 			}
 		}
 

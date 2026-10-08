@@ -33,7 +33,7 @@
           };
           ldflags = [ "-s" "-w" ];
 
-          vendorHash = "sha256-KZu3gb4UVtxTyixIfsZ2lwvJVFNSl3GrhIHPh01aJaA=";
+          vendorHash = "sha256-G4PlRUToaEeZs8N/a54KDhGGWYnaShgAXHuL2iPO+hY=";
 
           postInstall = ''
             if [ -f "$out/bin/server" ]; then

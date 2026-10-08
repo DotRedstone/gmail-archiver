@@ -32,10 +32,15 @@
 ├── internal/
 │   ├── config/                  # 环境变量 / 命令行参数加载与校验
 │   ├── imap/                    # IMAP 连接管理、IDLE 长连接循环、心跳与断线重连
-│   ├── parser/                  # 邮件 MIME 树解析、附件提取、文件名解码
+│   ├── parser/                  # 邮件 MIME 树解析、正文与附件提取、文件名解码
 │   ├── storage/                 # 文件落盘存储引擎（按 YYYY/MM 目录分层归档，防目录穿越）
-│   ├── db/                      # 嵌入式 SQLite 模型、自动迁移 (Migration)、CRUD 查询
-│   └── api/                     # REST HTTP API 路由与处理器、下载流式传输与鉴权
+│   ├── db/                      # 嵌入式 SQLite 模型、自动迁移 (Migration)、版本更正与 CRUD
+│   ├── roster/                  # 学生花名册解析引擎（独立 CSV、字段自动映射与索引）
+│   ├── rule/                    # 作业规则正则提取引擎（独立 YAML、多源容错与自动规整重命名）
+│   └── api/                     # REST HTTP API 路由与处理器、未交催收统计与打包下载
+├── data/
+│   ├── rosters/                 # 班级名单 CSV 文件库
+│   └── rules/                   # 课程作业规则 YAML 库
 ├── flake.nix                    # Nix 构建与 NixOS Systemd 部署模块
 ├── flake.lock
 ├── go.mod
@@ -171,6 +176,30 @@ nix build
   - 支持标准 HTTP Range 头分块/断点续传；
   - 自动设置 `Content-Disposition: attachment; filename="..."; filename*=UTF-8''...` 保证各种浏览器下的中文文件名正常解析；
   - 严格防路径穿越安全校验。
+
+---
+
+## 作业管理与后继更正覆盖机制
+
+服务针对教学收作业场景，实现了名单（CSV）与规则（YAML）的彻底解耦，并内置了**更正提交自动覆盖**机制：
+
+### 1. 更正与覆盖机制
+
+- **自动版本递增**：学生重复发送邮件更正作业时，系统自动识别并将版本递增（v1 $\to$ v2 $\to$ v3）；
+- **有效版本自动覆盖**：系统自动将先前版本置为失效（`is_latest = false`），最新提交置为唯一有效版本（`is_latest = true`）；
+- **历史记录完整保留**：旧版文件与历史提交记录在数据库中完整存档，支持版本对比与争议溯源；
+- **一键打包始终为最新版**：导出整班作业 Zip 时，默认仅打包每位学生的最新有效版本，解压后没有任何多余重复文件。
+
+### 2. 作业专属 API
+
+| 方法 | 路径 | 说明 |
+| :--- | :--- | :--- |
+| `GET` | `/api/assignments` | 查看已加载的所有作业规则、应交人数与截止时间 |
+| `GET` | `/api/assignments/{id}/status` | **作业总览**：应交数、实交数、提交率、迟交数 |
+| `GET` | `/api/assignments/{id}/missing` | **未交名单**：直接输出未交学生的学号、姓名、班级（用于群内催交） |
+| `GET` | `/api/assignments/{id}/submissions` | 查看当前所有学生的最新有效作业详情 |
+| `GET` | `/api/assignments/{id}/submissions/{student_id}/history` | 查看某位学生的全部提交历史（查看更正时间线） |
+| `GET` | `/api/assignments/{id}/export` | **一键打包**：将该作业所有学生的最新有效附件按规范格式重命名打包为单个 Zip 下载 |
 
 ---
 

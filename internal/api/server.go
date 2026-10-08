@@ -1,9 +1,11 @@
 package api
 
 import (
+	"archive/zip"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +19,7 @@ import (
 	"github.com/dot/gmail-archiver/internal/config"
 	"github.com/dot/gmail-archiver/internal/db"
 	"github.com/dot/gmail-archiver/internal/imap"
+	"github.com/dot/gmail-archiver/internal/rule"
 	"github.com/dot/gmail-archiver/internal/storage"
 )
 
@@ -26,15 +29,17 @@ type Server struct {
 	database  *db.DB
 	storage   *storage.Engine
 	watcher   *imap.Watcher
+	rules     *rule.Engine
 	startTime time.Time
 }
 
-func NewServer(cfg *config.Config, database *db.DB, storageEngine *storage.Engine, watcher *imap.Watcher) *Server {
+func NewServer(cfg *config.Config, database *db.DB, storageEngine *storage.Engine, watcher *imap.Watcher, ruleEngine *rule.Engine) *Server {
 	return &Server{
 		cfg:       cfg,
 		database:  database,
 		storage:   storageEngine,
 		watcher:   watcher,
+		rules:     ruleEngine,
 		startTime: time.Now().UTC(),
 	}
 }
@@ -60,6 +65,15 @@ func (s *Server) Routes() http.Handler {
 		api.Route("/api/attachments", func(att chi.Router) {
 			att.Get("/", s.handleListAttachments)
 			att.Get("/{id}/download", s.handleDownloadAttachment)
+		})
+
+		api.Route("/api/assignments", func(as chi.Router) {
+			as.Get("/", s.handleListAssignments)
+			as.Get("/{id}/status", s.handleAssignmentStatus)
+			as.Get("/{id}/missing", s.handleAssignmentMissing)
+			as.Get("/{id}/submissions", s.handleAssignmentSubmissions)
+			as.Get("/{id}/submissions/{student_id}/history", s.handleStudentSubmissionHistory)
+			as.Get("/{id}/export", s.handleAssignmentExportZip)
 		})
 	})
 
@@ -242,4 +256,216 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 
 func writeJSONError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
+}
+
+// [AssignmentHandlers]
+func (s *Server) handleListAssignments(w http.ResponseWriter, r *http.Request) {
+	if s.rules == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+
+	rules := s.rules.Rules()
+	type assignmentItem struct {
+		ID             string    `json:"id"`
+		Name           string    `json:"name"`
+		Deadline       time.Time `json:"deadline"`
+		TotalExpected  int       `json:"total_expected"`
+		TargetFilename string    `json:"target_filename"`
+	}
+
+	list := make([]assignmentItem, 0, len(rules))
+	for _, rule := range rules {
+		list = append(list, assignmentItem{
+			ID:             rule.ID,
+			Name:           rule.Name,
+			Deadline:       rule.Deadline,
+			TotalExpected:  rule.Roster.Count(),
+			TargetFilename: rule.TargetFilename,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) handleAssignmentStatus(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if s.rules == nil {
+		writeJSONError(w, http.StatusNotFound, "rule engine not initialized")
+		return
+	}
+
+	rule, ok := s.rules.GetRule(id)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "assignment rule not found")
+		return
+	}
+
+	latestSubs, err := s.database.GetLatestSubmissions(id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to query submissions: "+err.Error())
+		return
+	}
+
+	totalExpected := rule.Roster.Count()
+	submittedCount := len(latestSubs)
+	lateCount := 0
+	for _, sub := range latestSubs {
+		if sub.IsLate {
+			lateCount++
+		}
+	}
+
+	missingCount := totalExpected - submittedCount
+	if missingCount < 0 {
+		missingCount = 0
+	}
+
+	rate := "0.0%"
+	if totalExpected > 0 {
+		rate = fmt.Sprintf("%.1f%%", float64(submittedCount)/float64(totalExpected)*100)
+	}
+
+	resp := map[string]any{
+		"assignment_id":   rule.ID,
+		"assignment_name": rule.Name,
+		"deadline":        rule.Deadline,
+		"total_expected":  totalExpected,
+		"submitted_count": submittedCount,
+		"missing_count":   missingCount,
+		"late_count":      lateCount,
+		"submission_rate": rate,
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleAssignmentMissing(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if s.rules == nil {
+		writeJSONError(w, http.StatusNotFound, "rule engine not initialized")
+		return
+	}
+
+	rule, ok := s.rules.GetRule(id)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "assignment rule not found")
+		return
+	}
+
+	latestSubs, err := s.database.GetLatestSubmissions(id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to query submissions: "+err.Error())
+		return
+	}
+
+	submittedMap := make(map[string]bool)
+	for _, sub := range latestSubs {
+		submittedMap[sub.StudentID] = true
+	}
+
+	allStudents := rule.Roster.All()
+	var missing []any
+	for _, st := range allStudents {
+		if !submittedMap[st.StudentID] {
+			missing = append(missing, map[string]string{
+				"student_id": st.StudentID,
+				"name":       st.Name,
+				"class_name": st.ClassName,
+				"gender":     st.Gender,
+			})
+		}
+	}
+
+	resp := map[string]any{
+		"assignment_id":   rule.ID,
+		"assignment_name": rule.Name,
+		"missing_count":   len(missing),
+		"missing_list":    missing,
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleAssignmentSubmissions(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	latestSubs, err := s.database.GetLatestSubmissions(id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to query submissions: "+err.Error())
+		return
+	}
+
+	if latestSubs == nil {
+		latestSubs = []*db.Submission{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"assignment_id": id,
+		"count":         len(latestSubs),
+		"submissions":   latestSubs,
+	})
+}
+
+func (s *Server) handleStudentSubmissionHistory(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	studentID := chi.URLParam(r, "student_id")
+
+	history, err := s.database.GetStudentSubmissionHistory(id, studentID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to query history: "+err.Error())
+		return
+	}
+
+	if history == nil {
+		history = []*db.Submission{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"assignment_id": id,
+		"student_id":    studentID,
+		"total_version": len(history),
+		"history":       history,
+	})
+}
+
+func (s *Server) handleAssignmentExportZip(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	latestSubs, err := s.database.GetLatestSubmissions(id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to query submissions: "+err.Error())
+		return
+	}
+
+	zipFilename := fmt.Sprintf("%s-submissions.zip", id)
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", zipFilename))
+
+	zw := zip.NewWriter(w)
+	defer zw.Close()
+
+	for _, sub := range latestSubs {
+		absPath, err := s.storage.ResolveAbsolutePath(sub.StoragePath)
+		if err != nil {
+			continue
+		}
+
+		file, err := os.Open(absPath)
+		if err != nil {
+			continue
+		}
+
+		entryName := sub.TargetFilename
+		if entryName == "" {
+			entryName = fmt.Sprintf("%s-%s.zip", sub.StudentID, sub.StudentName)
+		}
+
+		fw, err := zw.Create(entryName)
+		if err != nil {
+			file.Close()
+			continue
+		}
+
+		_, _ = io.Copy(fw, file)
+		file.Close()
+	}
 }
