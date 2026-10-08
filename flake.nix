@@ -113,6 +113,12 @@
               default = null;
               description = "Optional path to file containing API Key for authentication.";
             };
+
+            environmentFile = lib.mkOption {
+              type = lib.types.nullOr lib.types.path;
+              default = null;
+              description = "Path to environment file containing secrets (e.g. IMAP_PASSWORD, API_KEY).";
+            };
           };
 
           config = lib.mkIf cfg.enable {
@@ -122,27 +128,35 @@
               after = [ "network-online.target" ];
               wants = [ "network-online.target" ];
 
-              script = ''
-                export IMAP_SERVER="${cfg.imapServer}"
-                export IMAP_USER="${cfg.imapUser}"
-                export DATA_DIR="${cfg.dataDir}"
-                export HTTP_PORT="${toString cfg.httpPort}"
+              environment = {
+                IMAP_SERVER = cfg.imapServer;
+                IMAP_USER = cfg.imapUser;
+                DATA_DIR = cfg.dataDir;
+                HTTP_PORT = toString cfg.httpPort;
+              };
 
-                ${lib.optionalString (cfg.passwordFile != null) ''
-                  export IMAP_PASSWORD="$(cat "${cfg.passwordFile}")"
-                ''}
-
-                ${lib.optionalString (cfg.apiKeyFile != null) ''
-                  export API_KEY="$(cat "${cfg.apiKeyFile}")"
-                ''}
-
-                exec ${cfg.package}/bin/gmail-archiver
-              '';
+              script =
+                let
+                  hasLegacyFiles = (cfg.passwordFile != null) || (cfg.apiKeyFile != null);
+                in
+                if hasLegacyFiles then ''
+                  ${lib.optionalString (cfg.passwordFile != null) ''
+                    export IMAP_PASSWORD="$(cat "${cfg.passwordFile}")"
+                  ''}
+                  ${lib.optionalString (cfg.apiKeyFile != null) ''
+                    export API_KEY="$(cat "${cfg.apiKeyFile}")"
+                  ''}
+                  exec ${cfg.package}/bin/gmail-archiver
+                '' else ''
+                  exec ${cfg.package}/bin/gmail-archiver
+                '';
 
               serviceConfig = {
                 Type = "simple";
                 Restart = "always";
                 RestartSec = "10s";
+
+                EnvironmentFile = lib.optional (cfg.environmentFile != null) cfg.environmentFile;
 
                 # Security hardening & StateDirectory
                 DynamicUser = true;

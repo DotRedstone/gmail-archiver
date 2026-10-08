@@ -4,3 +4,8 @@ data/
 *.db-wal
 *.db-shm
 bin/
+cmd/audit_mailbox/
+cmd/diagnose/
+cmd/full_audit/
+cmd/inspect/
+cmd/inspect_body/
