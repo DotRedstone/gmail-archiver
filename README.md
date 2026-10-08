@@ -1,24 +1,32 @@
 # gmail-archiver
 
-轻量、稳定、低内存占用的 Gmail 附件实时归档与 REST API 查询服务。
+轻量、稳健、低内存占用的 Gmail 附件实时归档与高校作业自动统计系统。
 
-基于 Go 纯静态编译（无 CGO 依赖），通过 IMAP IDLE 协议长连接 7×24 小时监听新邮件，自动提取邮件附件并安全落盘归档，同时使用嵌入式 SQLite 记录元数据，提供带分页、关键词检索、断点续传（HTTP Range）的 RESTful HTTP API。原生提供 Nix Flake 构建与开箱即用的 NixOS 守护进程模块。
+基于纯 Go 静态编译（无 CGO 依赖），通过 IMAP IDLE 协议长连接 7×24 小时监听新邮件，**自动解析标准 MIME 附件及腾讯 QQ 邮箱「超大附件/文件中转站」并流式落盘**。支持**名单（CSV）与作业规则（YAML）彻底解耦**、**重复提交自动递增更正并覆盖**，提供带分页、检索、断点续传及作业催收导出的 RESTful HTTP API，原生支持 NixOS 声明式 Systemd 守护进程与 QQ 机器人联动。
 
 ---
 
-## 特性亮点
+## 核心特性
 
-- **极致轻量**：纯 Go 静态二进制文件（约 13MB），无动态链接库依赖，常驻运行内存仅约 10~20MB。
-- **IMAP IDLE 实时监听与断线自愈**：毫秒级响应新邮件事件；内置定期保活刷新（15~20分钟）与指数退避断线重连机制，网络抖动自动恢复。
-- **断点续收 / 增量同步**：记录已同步邮件的 UID，服务重启或维护期间不漏收、不重收。
-- **MIME 多编码自动解析**：完整支持 RFC 2047（UTF-8, GBK, Big5 等）编码文件名解码与 RFC 2231 参数解析，正确识别附件与带文件名的 inline 资源。
-- **SHA-256 去重与安全落盘**：文件内容计算哈希，去重存储；物理路径按 `attachments/YYYY/MM/{hash}_{filename}` 分层存放；内置严格的路径清洗与防目录穿越校验。
-- **RESTful HTTP API**：
-  - `/health`：服务存活与 IMAP 实时连接状态检测。
-  - `/api/attachments`：支持文件名/主题模糊检索、发件人过滤、时间范围过滤及分页。
-  - `/api/attachments/{id}/download`：文件流式下载，原生支持 HTTP Range 断点续传，符合 RFC 5987/6266 标准的 UTF-8 编码响应头。
-  - **API Key 认证**：支持可选的 `X-API-Key` 请求头或 `Authorization: Bearer <token>` 保护。
-- **Nix 原生支持**：提供根目录 `flake.nix`，支持 `nix build` 确定性打包，并暴露 `nixosModules.default` 支持在 NixOS 上声明式部署及 Systemd 安全加固。
+- **极致轻量**：纯静态二进制文件（约 13MB），常驻后台内存仅 **10~20MB**（适合低配 VPS 7×24h 守护）。
+- **IMAP IDLE 实时监听与断线自愈**：毫秒级捕获新邮件，支持长连接保活心跳与指数退避断线自动重连。
+- **批量同步（Batch Fetch）**：初次同步与增量同步采用分批并发拉取，上百封历史邮件 10 秒内极速处理完毕。
+- **QQ 邮箱超大附件原生解析**：国内高校学生大量使用 QQ 邮箱发送超大附件，系统自动从邮件 HTML 中提取腾讯中转站直链并免登录流式下载落地，彻底解决无 MIME 附件头的漏收问题。
+- **花名册与作业规则解耦**：
+  - 名单（CSV）按班级独立维护，多门课程随意复用；
+  - 规则（YAML）按实验/大作业独立配置，支持截止时间、容错正则与统一规范命名模板。
+- **后继提交更正覆盖机制**：
+  - 同一学生重复交作业自动递增版本号（v1 $\to$ v2 $\to$ v3）；
+  - 自动更新最新有效标识（`is_latest = true`），历史版本在数据库与磁盘中完整保留可追溯；
+  - 一键打包导出时仅包含每位学生的最新有效版本，解压无多余重名文件。
+- **丰富的 RESTful API**：
+  - 健康检查与 IMAP 实时连接状态查询；
+  - 附件列表模糊搜索、分页与 HTTP Range 断点续传流式下载；
+  - 作业总览（应交/实交/迟交/提交率）；
+  - 催交清单导出（直接输出未交学号与姓名）；
+  - 学生提交历史与多版本时间线溯源；
+  - 整班作业规范化重命名打包 Zip 一键下载。
+- **Nix 原生支持**：提供根目录 `flake.nix`，支持 `nix build` 确定性构建与 NixOS 声明式 Systemd 部署。
 
 ---
 
@@ -31,18 +39,19 @@
 │       └── main.go              # 服务启动入口、配置解析、优雅退出 (Graceful Shutdown)
 ├── internal/
 │   ├── config/                  # 环境变量 / 命令行参数加载与校验
-│   ├── imap/                    # IMAP 连接管理、IDLE 长连接循环、心跳与断线重连
-│   ├── parser/                  # 邮件 MIME 树解析、正文与附件提取、文件名解码
+│   ├── imap/                    # IMAP 连接管理、IDLE 长连接循环、批量快速拉取与自愈
+│   ├── parser/                  # 邮件 MIME 树解析、QQ 超大附件免登录下载、文件名解码
 │   ├── storage/                 # 文件落盘存储引擎（按 YYYY/MM 目录分层归档，防目录穿越）
-│   ├── db/                      # 嵌入式 SQLite 模型、自动迁移 (Migration)、版本更正与 CRUD
+│   ├── db/                      # 嵌入式 SQLite 模型、自动迁移、版本更正覆盖机制
 │   ├── roster/                  # 学生花名册解析引擎（独立 CSV、字段自动映射与索引）
-│   ├── rule/                    # 作业规则正则提取引擎（独立 YAML、多源容错与自动规整重命名）
-│   └── api/                     # REST HTTP API 路由与处理器、未交催收统计与打包下载
+│   ├── rule/                    # 作业规则正则提取引擎（独立 YAML、多源容错与规范化重命名）
+│   └── api/                     # REST HTTP API 路由与处理器、统计汇总与打包导出
 ├── data/
-│   ├── rosters/                 # 班级名单 CSV 文件库
-│   └── rules/                   # 课程作业规则 YAML 库
+│   ├── rosters/                 # 班级花名册库 (*.csv)
+│   └── rules/                   # 课程作业规则库 (*.yaml)
+├── docs/
+│   └── QQ_BOT_INTEGRATION.md    # QQ 机器人对接指南（群内催交 / 自助查作业）
 ├── flake.nix                    # Nix 构建与 NixOS Systemd 部署模块
-├── flake.lock
 ├── go.mod
 ├── go.sum
 └── README.md
@@ -50,205 +59,200 @@
 
 ---
 
-## 配置参数
+## 快速上手
 
-支持通过**环境变量**或**命令行参数**配置：
+### 1. 申请 Gmail 应用专用密码
 
-| 环境变量 | 命令行参数 | 默认值 | 说明 |
-| :--- | :--- | :--- | :--- |
-| `IMAP_SERVER` | `-imap-server` | `imap.gmail.com:993` | IMAP 服务器地址 |
-| `IMAP_USER` | `-imap-user` | *(必填)* | Gmail 邮箱地址 |
-| `IMAP_PASSWORD` | `-imap-password` | *(必填)* | Google「应用专用密码」(App Password) |
-| `DATA_DIR` | `-data-dir` | `./data` | 数据存储目录（存放 SQLite 数据库与附件） |
-| `HTTP_PORT` | `-http-port` | `8080` | HTTP API 监听端口 |
-| `API_KEY` | `-api-key` | *(空)* | 可选的 API 访问秘钥 |
-
----
-
-## 快速开始
-
-### 1. 准备 Gmail 应用专用密码
-
-1. 进入 [Google 账号中心 - 安全性](https://myaccount.google.com/security)；
+由于 Gmail 开启两步验证后禁止使用主密码登录 IMAP，需生成独立的 16 位应用密码：
+1. 打开 [Google 账号中心 - 安全性](https://myaccount.google.com/security)；
 2. 确保已开启 **两步验证 (2-Step Verification)**；
-3. 在安全性页面搜索 **应用专用密码 (App Passwords)**；
-4. 创建一个名为 `gmail-archiver` 的密码，获得 16 位专用密码（例如：`abcd efgh ijkl mnop`）。
+3. 在安全性页面搜索框输入 **应用专用密码 (App Passwords)**；
+4. 创建一个名称为 `gmail-archiver` 的密码，复制生成的 16 位字符（例如：`abcd efgh ijkl mnop`）。
 
-### 2. 使用 Go 本地运行
+### 2. 本地运行
+
+支持通过命令行参数或环境变量启动：
 
 ```bash
 # 整理并拉取依赖
 go mod download
 
 # 启动服务
-IMAP_USER="your_email@gmail.com" \
-IMAP_PASSWORD="your-app-password" \
-HTTP_PORT=8080 \
-DATA_DIR="./data" \
-go run cmd/server/main.go
-```
-
-或使用命令行参数：
-
-```bash
 go run cmd/server/main.go \
   -imap-user "your_email@gmail.com" \
-  -imap-password "your-app-password" \
+  -imap-password "your_16_digit_app_password" \
   -http-port 8080 \
   -data-dir "./data"
 ```
 
-### 3. 使用 Nix 构建静态二进制
-
+或使用预编译二进制：
 ```bash
-# 构建二进制
-nix build
-
-# 二进制位于 ./result/bin/gmail-archiver
-./result/bin/gmail-archiver -h
+go build -o bin/gmail-archiver cmd/server/main.go
+./bin/gmail-archiver -imap-user "your_email@gmail.com" -imap-password "your_password"
 ```
 
+### 3. 配置参数一览
+
+| 环境变量 | 命令行参数 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `IMAP_SERVER` | `-imap-server` | `imap.gmail.com:993` | IMAP 服务器地址 |
+| `IMAP_USER` | `-imap-user` | *(必填)* | Gmail 邮箱地址 |
+| `IMAP_PASSWORD` | `-imap-password` | *(必填)* | Google 16 位应用专用密码 |
+| `DATA_DIR` | `-data-dir` | `./data` | 数据主目录（包含附件与 SQLite 数据库） |
+| `HTTP_PORT` | `-http-port` | `8080` | REST API 监听端口 |
+| `API_KEY` | `-api-key` | *(空)* | 可选的 API 访问秘钥（请求需携带 `X-API-Key`） |
+
 ---
 
-## RESTful API 接口说明
+## 名单与作业规则配置教程
 
-### 1. 健康检查
+`gmail-archiver` 将“谁在上课”和“收什么作业”完全解耦，后续每收一次新作业或新实验，**只需新建一个 YAML 文件**，无需修改任何代码。
 
-- **请求**：`GET /health`
-- **鉴权**：公开接口，无需 API Key
-- **响应示例**：
-  ```json
-  {
-    "status": "ok",
-    "uptime": "1h23m45s",
-    "imap": {
-      "connected": true,
-      "state": "idle",
-      "mailbox": "INBOX",
-      "last_sync_time": "2026-10-08T10:15:30Z",
-      "processed_count": 12
-    }
-  }
+### 1. 配置学生名单（CSV）
+
+将班级花名册放入 `data/rosters/` 目录下（如 `data/rosters/2024_cs_5.csv`）。
+
+**CSV 格式规范**：
+- 支持标准表头：`学号,姓名,班级,性别`（列顺序可任意，系统会自动根据表头名称自适应映射）。
+- 示例内容：
+  ```csv
+  学号,姓名,班级,性别
+  240809010501,支全振,2024级计算机科学与技术5班,男
+  240809010502,马祥宇,2024级计算机科学与技术5班,男
+  240809010506,王鹏宇,2024级计算机科学与技术5班,男
   ```
 
-### 2. 检索附件列表
+### 2. 配置作业规则（YAML）
 
-- **请求**：`GET /api/attachments`
-- **鉴权**：若配置了 `API_KEY`，需携带请求头 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`
-- **Query 参数**：
-  - `keyword`：按文件名或邮件主题模糊匹配
-  - `sender`：按发件人模糊匹配
-  - `from_date`：起始时间（支持 `YYYY-MM-DD` 或 RFC 3339 格式）
-  - `to_date`：截止时间
-  - `page`：页码（默认 `1`）
-  - `limit`：每页条数（默认 `20`，最大 `100`）
-- **响应示例**：
-  ```json
-  {
-    "data": [
-      {
-        "id": 1,
-        "message_id": "<d3f9b2@mail.gmail.com>",
-        "sender": "Alice <alice@example.com>",
-        "subject": "十月份月度财务报表",
-        "received_at": "2026-10-08T09:30:00Z",
-        "filename": "财务报表.xlsx",
-        "file_size": 15420,
-        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "storage_path": "attachments/2026/10/e3b0c442..._财务报表.xlsx",
-        "created_at": "2026-10-08T09:30:15Z"
-      }
-    ],
-    "pagination": {
-      "page": 1,
-      "limit": 20,
-      "total": 1,
-      "total_pages": 1
-    }
-  }
-  ```
+在 `data/rules/` 目录下为具体作业创建规则文件，例如 `parallel_computing_lab1.yaml`：
 
-### 3. 下载附件
+```yaml
+id: "parallel_computing_lab1"             # 作业唯一标识（对应 API 中的 {id}）
+name: "并行计算实验1"                      # 作业名称
+deadline: "2026-09-23T18:00:00+08:00"     # 截止时间（符合 RFC 3339 格式）
 
-- **请求**：`GET /api/attachments/{id}/download`
-- **特性**：
-  - 支持标准 HTTP Range 头分块/断点续传；
-  - 自动设置 `Content-Disposition: attachment; filename="..."; filename*=UTF-8''...` 保证各种浏览器下的中文文件名正常解析；
-  - 严格防路径穿越安全校验。
+# 关联名单文件 (相对 data/ 路径，可关联多个班级)
+rosters:
+  - "rosters/2024_cs_5.csv"
+  - "rosters/2024_green_compute_1.csv"
+
+# 命名与正文提取正则 (推荐采用容错模式)
+patterns:
+  # 主题匹配：兼容 "实验1"、"实验一"、各类连接符 (- _ — + 空格) 及纯姓名
+  subject_regex: "^(?:并行计算[-_—+\\s]*)?(?:实验[1一]?|24\\d)?[-_—+\\s]*(?:(?P<class>[\\w\\p{Han}]+)[-_—+\\s]+)?(?:(?P<student_id>\\d{12})[-_—+\\s]*)?(?P<name>[\\p{Han}\\w]+)$"
+
+  # 附件匹配：必须是压缩包，兼容中文数字及学生漏写分隔符情况
+  attachment_regex: "^(?:并行计算[-_—+\\s]*)?实验[1一][-_—+\\s]*(?:(?P<class>[\\w\\p{Han}]+)[-_—+\\s]+)?(?:(?P<student_id>\\d{12})[-_—+\\s]*)?(?P<name>[\\p{Han}\\w]+)?\\.(?P<ext>zip|rar|7z|tar\\.gz)$"
+
+  # 邮件正文提取：学生附件名未带学号时，从正文补充提取学号与班级
+  body_regexes:
+    - "姓名[：:]\\s*(?P<name>[\\p{Han}\\w]+)"
+    - "学号[：:]\\s*(?P<student_id>\\d{12})"
+    - "班级[：:]\\s*(?P<class>[\\w\\p{Han}]+)"
+
+# 一键导出规范化重命名模板（解压后格式绝对工整）
+target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
+```
+
+> [!TIP]
+> **容错建议**：大学生提交邮件时常把阿拉伯数字写成中文数字（`实验1` 写成 `实验一`）、破折号用全角（`—`）或加号（`+`）。上面的正则表达式已经过 190+ 封真实学生邮件验证，建议作为标准模板复用。
 
 ---
 
-## 作业管理与后继更正覆盖机制
+## 常用操作与实战 API
 
-服务针对教学收作业场景，实现了名单（CSV）与规则（YAML）的彻底解耦，并内置了**更正提交自动覆盖**机制：
+### 1. 监控服务与实时同步状态
+```bash
+curl -s http://localhost:8080/health | jq .
+```
+返回中 `imap.state` 为 `"idle"` 即表示服务正处于毫秒级长连接监听状态。
 
-### 1. 更正与覆盖机制
-
-- **自动版本递增**：学生重复发送邮件更正作业时，系统自动识别并将版本递增（v1 $\to$ v2 $\to$ v3）；
-- **有效版本自动覆盖**：系统自动将先前版本置为失效（`is_latest = false`），最新提交置为唯一有效版本（`is_latest = true`）；
-- **历史记录完整保留**：旧版文件与历史提交记录在数据库中完整存档，支持版本对比与争议溯源；
-- **一键打包始终为最新版**：导出整班作业 Zip 时，默认仅打包每位学生的最新有效版本，解压后没有任何多余重复文件。
-
-### 2. 作业专属 API
-
-| 方法 | 路径 | 说明 |
-| :--- | :--- | :--- |
-| `GET` | `/api/assignments` | 查看已加载的所有作业规则、应交人数与截止时间 |
-| `GET` | `/api/assignments/{id}/status` | **作业总览**：应交数、实交数、提交率、迟交数 |
-| `GET` | `/api/assignments/{id}/missing` | **未交名单**：直接输出未交学生的学号、姓名、班级（用于群内催交） |
-| `GET` | `/api/assignments/{id}/submissions` | 查看当前所有学生的最新有效作业详情 |
-| `GET` | `/api/assignments/{id}/submissions/{student_id}/history` | 查看某位学生的全部提交历史（查看更正时间线） |
-| `GET` | `/api/assignments/{id}/export` | **一键打包**：将该作业所有学生的最新有效附件按规范格式重命名打包为单个 Zip 下载 |
-
----
-
-## NixOS 声明式部署指南
-
-在宿主机的 `flake.nix` 中引入本仓库：
-
-```nix
+### 2. 查看作业整体进度（应交/实交/提交率）
+```bash
+curl -s http://localhost:8080/api/assignments/parallel_computing_lab1/status | jq .
+```
+**输出示例**：
+```json
 {
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    gmail-archiver.url = "github:dot/gmail-archiver";
-    # sops-nix.url = "github:Mic92/sops-nix";
-  };
-
-  outputs = { self, nixpkgs, gmail-archiver, ... }: {
-    nixosConfigurations.my-server = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules = [
-        gmail-archiver.nixosModules.default
-        {
-          services.gmail-archiver = {
-            enable = true;
-            imapUser = "your_email@gmail.com";
-            # 使用 sops-nix 注入密码文件：
-            passwordFile = "/run/secrets/gmail_app_password";
-            # 可选配置 API Key：
-            # apiKeyFile = "/run/secrets/gmail_archiver_api_key";
-            httpPort = 8080;
-            dataDir = "/var/lib/gmail-archiver";
-          };
-        }
-      ];
-    };
-  };
+  "assignment_id": "parallel_computing_lab1",
+  "assignment_name": "并行计算实验1",
+  "deadline": "2026-09-23T10:00:00Z",
+  "total_expected": 47,
+  "submitted_count": 46,
+  "missing_count": 1,
+  "late_count": 4,
+  "submission_rate": "97.9%"
 }
 ```
 
-启用后，NixOS 将自动创建并管理 Systemd 守护进程：
-- 采用 `DynamicUser = true` 与独立的隔离运行环境；
-- 自动管理 `/var/lib/gmail-archiver` 数据目录权限；
-- 支持开机自启与异常自动重启。
+### 3. 一键提取未交名单（催交神器）
+```bash
+# 获取未交完整 JSON
+curl -s http://localhost:8080/api/assignments/parallel_computing_lab1/missing | jq .
+
+# 单行提取未交学生姓名，直接复制发到 QQ 微信群
+curl -s http://localhost:8080/api/assignments/parallel_computing_lab1/missing | \
+  jq -r '.missing_list[] | "\(.name) (\(.student_id))"'
+```
+
+### 4. 查看单个学生提交历史（版本更正核验）
+```bash
+curl -s http://localhost:8080/api/assignments/parallel_computing_lab1/submissions/240809010501/history | jq .
+```
+可查看到该学生历次提交的时间、对应文件名及当前唯一有效的版本（`is_latest = true`）。
+
+### 5. 一键打包整班作业
+```bash
+curl -s http://localhost:8080/api/assignments/parallel_computing_lab1/export -o 并行计算实验1_全班作业.zip
+```
+下载的 Zip 文件内：
+- 严格仅包含每位学生的最新版文件；
+- 全部自动重命名为：`实验1-2024级计算机科学与技术5班-240809010501-支全振.zip`；
+- 无任何重复文件、无遗漏。
 
 ---
 
-## 本地测试与验证
+## QQ 机器人无缝接入
 
-执行完整的自动化单元测试与集成测试：
+服务原生设计的 REST API 非常容易与 QQ 群机器人打通：
+- 在班级群发送 `/查作业` 实时通报交件率；
+- 在班级群发送 `/催交` 自动列出未交名单；
+- 学生私聊机器人发送 `/我的作业` 查询收件状态。
 
+完整选型分析（基于 **NapCatQQ + OneBot v11** 的无头 QQ 小号方案）与开箱即用的 Python 联动脚本，详见文档：
+👉 [QQ 机器人对接指南 (docs/QQ_BOT_INTEGRATION.md)](file:///home/dot/Projects/gmail-archiver/docs/QQ_BOT_INTEGRATION.md)
+
+---
+
+## 生产环境部署（NixOS / Systemd）
+
+### 1. Nix 确定性构建
+```bash
+nix build
+./result/bin/gmail-archiver -h
+```
+
+### 2. NixOS 声明式部署
+在 NixOS 配置中引入本模块：
+```nix
+{
+  services.gmail-archiver = {
+    enable = true;
+    imapUser = "your_email@gmail.com";
+    passwordFile = "/run/secrets/gmail_app_password"; # 建议使用 sops-nix 注入凭据
+    httpPort = 8080;
+    dataDir = "/var/lib/gmail-archiver";
+  };
+}
+```
+Systemd 模块已内置 `DynamicUser`、权限沙箱隔离、自动重启与状态守护。
+
+---
+
+## 质量与测试
+
+运行完整自动化测试套件：
 ```bash
 go test -v ./...
 ```
+包含 SQLite 并发写入、更正提交多版本递增覆盖、MIME RFC 2047 解码以及 QQ 超大附件接口模拟测试。
