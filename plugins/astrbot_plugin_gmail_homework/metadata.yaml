@@ -1,0 +1,5 @@
+name: astrbot_plugin_gmail_homework
+desc: Gmail 作业归档查询、自动催交与多轮文件直传插件
+author: DotRedstone
+version: 1.2.3
+repo: "https://github.com/DotRedstone/gmail-archiver"
