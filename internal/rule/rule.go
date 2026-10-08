@@ -191,12 +191,14 @@ func (r *AssignmentRule) Match(subject, filename, bodyText string, receivedAt ti
 
 	// 1. Try attachment filename regex
 	if r.attachmentRe != nil {
-		if matches := extractNamedGroups(r.attachmentRe, filename); len(matches) > 0 {
-			for k, v := range matches {
-				extracted[k] = v
-			}
-			matchedBy = "attachment_regex"
+		matches := extractNamedGroups(r.attachmentRe, filename)
+		if len(matches) == 0 {
+			return nil, false
 		}
+		for k, v := range matches {
+			extracted[k] = v
+		}
+		matchedBy = "attachment_regex"
 	}
 
 	// 2. Try subject regex

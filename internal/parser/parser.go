@@ -1,12 +1,17 @@
 package parser
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
+	"net/http"
+	"net/http/cookiejar"
 	"net/mail"
+	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -20,15 +25,25 @@ import (
 
 // [Parser]
 type Parser struct {
-	storage *storage.Engine
-	decoder *mime.WordDecoder
+	storage    *storage.Engine
+	decoder    *mime.WordDecoder
+	httpClient *http.Client
 }
 
 func New(storageEngine *storage.Engine) *Parser {
+	jar, _ := cookiejar.New(nil)
 	return &Parser{
 		storage: storageEngine,
 		decoder: &mime.WordDecoder{},
+		httpClient: &http.Client{
+			Jar:     jar,
+			Timeout: 60 * time.Second,
+		},
 	}
+}
+
+func (p *Parser) SetHTTPClient(client *http.Client) {
+	p.httpClient = client
 }
 
 // [EmailMetadata]
@@ -89,6 +104,7 @@ func (p *Parser) Parse(r io.Reader) (*EmailMetadata, error) {
 	}
 
 	// Extract attachments
+	var inlineBodies []string
 	partIndex := 0
 	for {
 		part, err := mr.NextPart()
@@ -119,9 +135,15 @@ func (p *Parser) Parse(r io.Reader) (*EmailMetadata, error) {
 				isAttachment = true
 				mimeType = contentType
 				filename = fn
-			} else if strings.EqualFold(contentType, "text/plain") && meta.BodyText == "" {
-				bodyBuf, _ := io.ReadAll(io.LimitReader(part.Body, 32*1024))
-				meta.BodyText = string(bodyBuf)
+			} else {
+				bodyBuf, _ := io.ReadAll(io.LimitReader(part.Body, 512*1024))
+				bodyStr := string(bodyBuf)
+				if isPlainBodyType(contentType) {
+					inlineBodies = append(inlineBodies, bodyStr)
+					if strings.EqualFold(contentType, "text/plain") && meta.BodyText == "" {
+						meta.BodyText = bodyStr
+					}
+				}
 			}
 		}
 
@@ -157,6 +179,13 @@ func (p *Parser) Parse(r io.Reader) (*EmailMetadata, error) {
 
 		meta.Attachments = append(meta.Attachments, att)
 	}
+
+	if meta.BodyText == "" && len(inlineBodies) > 0 {
+		meta.BodyText = inlineBodies[0]
+	}
+
+	// Detect and download QQ Mail large attachments from inline bodies
+	p.extractQQBigAttachments(inlineBodies, meta)
 
 	return meta, nil
 }
@@ -215,5 +244,132 @@ func (p *Parser) suggestExtension(mimeType string) string {
 			return exts[0]
 		}
 		return filepath.Ext("")
+	}
+}
+
+// [QQBigAttachment]
+var qqLinkRe = regexp.MustCompile(`https?://[^/\s"'>]+/ftn/download\?[^\s"'<>]+`)
+
+type qqFTNResp struct {
+	Head struct {
+		Ret int    `json:"ret"`
+		Msg string `json:"msg"`
+	} `json:"head"`
+	Body struct {
+		Name string `json:"name"`
+		Url  string `json:"url"`
+		Size int64  `json:"size"`
+	} `json:"body"`
+}
+
+func (p *Parser) extractQQBigAttachments(bodies []string, meta *EmailMetadata) {
+	if p.httpClient == nil {
+		return
+	}
+	seenLinks := make(map[string]bool)
+	for _, body := range bodies {
+		links := qqLinkRe.FindAllString(body, -1)
+		for _, rawLink := range links {
+			cleanLink := strings.ReplaceAll(rawLink, "&amp;", "&")
+			if seenLinks[cleanLink] {
+				continue
+			}
+			seenLinks[cleanLink] = true
+
+			u, err := url.Parse(cleanLink)
+			if err != nil {
+				continue
+			}
+			if !strings.Contains(u.Host, "qq.com") && !strings.Contains(u.Host, "127.0.0.1") && !strings.Contains(u.Host, "localhost") {
+				continue
+			}
+			q := u.Query()
+			key := q.Get("key")
+			code := q.Get("code")
+			k := q.Get("k")
+
+			form := url.Values{"f": {"json"}}
+			if key != "" && code != "" {
+				form.Set("func", "3")
+				form.Set("key", key)
+				form.Set("code", code)
+			} else if k != "" {
+				form.Set("k", k)
+			} else {
+				continue
+			}
+
+			apiURL := "https://wx.mail.qq.com/ftn/download"
+			if u.Host != "wx.mail.qq.com" && u.Host != "" {
+				apiURL = fmt.Sprintf("%s://%s/ftn/download", u.Scheme, u.Host)
+			}
+
+			req, err := http.NewRequest("POST", apiURL, strings.NewReader(form.Encode()))
+			if err != nil {
+				continue
+			}
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("User-Agent", "Mozilla/5.0")
+
+			resp, err := p.httpClient.Do(req)
+			if err != nil {
+				continue
+			}
+
+			var ftnResp qqFTNResp
+			decodeErr := json.NewDecoder(resp.Body).Decode(&ftnResp)
+			resp.Body.Close()
+			if decodeErr != nil || ftnResp.Head.Ret != 0 || ftnResp.Body.Url == "" {
+				continue
+			}
+
+			filename := ftnResp.Body.Name
+			if filename == "" {
+				filename = "qq_big_attachment.zip"
+			}
+
+			downURL := ftnResp.Body.Url
+			downReq, err := http.NewRequest("GET", downURL, nil)
+			if err != nil {
+				continue
+			}
+			downReq.Header.Set("User-Agent", "Mozilla/5.0")
+
+			downResp, err := p.httpClient.Do(downReq)
+			if err != nil {
+				continue
+			}
+			if downResp.StatusCode >= 400 {
+				downResp.Body.Close()
+				continue
+			}
+
+			relPath, sha256Hex, size, err := p.storage.Save(downResp.Body, filename, meta.ReceivedAt)
+			downResp.Body.Close()
+			if err != nil {
+				continue
+			}
+
+			cleanFilename := storage.SanitizeFilename(filename)
+			mimeType := mime.TypeByExtension(filepath.Ext(cleanFilename))
+			if mimeType == "" {
+				mimeType = "application/zip"
+			}
+
+			att := &db.Attachment{
+				MessageID:   meta.MessageID,
+				Sender:      meta.Sender,
+				Subject:     meta.Subject,
+				ReceivedAt:  meta.ReceivedAt,
+				Filename:    cleanFilename,
+				FileSize:    size,
+				SHA256:      sha256Hex,
+				MIMEType:    mimeType,
+				StoragePath: relPath,
+				CreatedAt:   time.Now().UTC(),
+			}
+
+			meta.Attachments = append(meta.Attachments, att)
+		}
 	}
 }

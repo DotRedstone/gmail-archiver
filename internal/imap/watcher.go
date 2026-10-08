@@ -250,25 +250,64 @@ func (w *Watcher) syncNewMessages(ctx context.Context, client *imapclient.Client
 
 	log.Printf("[imap] found %d message(s) to inspect (since UID %d)", len(uids), lastUID)
 
+	// Filter pending UIDs
+	var pending []goimap.UID
 	for _, uid := range uids {
+		if uint32(uid) > lastUID {
+			pending = append(pending, uid)
+		}
+	}
+	if len(pending) == 0 {
+		w.updateStatus(func(s *Status) {
+			s.LastSyncTime = time.Now().UTC()
+		})
+		return nil
+	}
+
+	log.Printf("[imap] inspecting %d new message(s) in batches", len(pending))
+
+	chunkSize := 25
+	for i := 0; i < len(pending); i += chunkSize {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
-		if uint32(uid) <= lastUID {
+		end := i + chunkSize
+		if end > len(pending) {
+			end = len(pending)
+		}
+		chunk := pending[i:end]
+
+		var uidSet goimap.UIDSet
+		uidSet.AddNum(chunk...)
+
+		fetchCmd := client.Fetch(uidSet, &goimap.FetchOptions{
+			UID:         true,
+			BodySection: []*goimap.FetchItemBodySection{{}},
+		})
+		buffers, err := fetchCmd.Collect()
+		if err != nil {
+			log.Printf("[imap] batch fetch error: %v", err)
 			continue
 		}
 
-		if err := w.fetchAndArchive(client, uid); err != nil {
-			log.Printf("[imap] error archiving message UID %d: %v", uid, err)
-		}
+		for _, msgBuf := range buffers {
+			bodyBytes := msgBuf.FindBodySection(&goimap.FetchItemBodySection{})
+			if len(bodyBytes) > 0 {
+				if err := w.processMessageBody(msgBuf.UID, bodyBytes); err != nil {
+					log.Printf("[imap] error processing message UID %d: %v", msgBuf.UID, err)
+				}
+			}
 
-		if err := w.db.SetLastSyncedUID(mailbox, uint32(uid)); err != nil {
-			log.Printf("[imap] failed to record synced UID %d: %v", uid, err)
+			if err := w.db.SetLastSyncedUID(mailbox, uint32(msgBuf.UID)); err != nil {
+				log.Printf("[imap] failed to record synced UID %d: %v", msgBuf.UID, err)
+			}
+			if uint32(msgBuf.UID) > lastUID {
+				lastUID = uint32(msgBuf.UID)
+			}
 		}
-		lastUID = uint32(uid)
 	}
 
 	w.updateStatus(func(s *Status) {
@@ -278,28 +317,7 @@ func (w *Watcher) syncNewMessages(ctx context.Context, client *imapclient.Client
 }
 
 // [Archive]
-func (w *Watcher) fetchAndArchive(client *imapclient.Client, uid goimap.UID) error {
-	fetchCmd := client.Fetch(goimap.UIDSetNum(uid), &goimap.FetchOptions{
-		UID:         true,
-		BodySection: []*goimap.FetchItemBodySection{{}},
-	})
-	defer fetchCmd.Close()
-
-	buffers, err := fetchCmd.Collect()
-	if err != nil {
-		return fmt.Errorf("fetch collect: %w", err)
-	}
-
-	if len(buffers) == 0 {
-		return nil
-	}
-
-	msgBuf := buffers[0]
-	bodyBytes := msgBuf.FindBodySection(&goimap.FetchItemBodySection{})
-	if len(bodyBytes) == 0 {
-		return nil
-	}
-
+func (w *Watcher) processMessageBody(uid goimap.UID, bodyBytes []byte) error {
 	meta, err := w.parser.Parse(bytes.NewReader(bodyBytes))
 	if err != nil {
 		return fmt.Errorf("parse email: %w", err)
@@ -313,21 +331,23 @@ func (w *Watcher) fetchAndArchive(client *imapclient.Client, uid goimap.UID) err
 
 	savedCount := 0
 	for _, att := range meta.Attachments {
-		exists, err := w.db.ExistsByMessageAndFilename(att.MessageID, att.Filename)
+		var id int64
+		existingID, exists, err := w.db.GetAttachmentIDByMessageAndFilename(att.MessageID, att.Filename)
 		if err != nil {
 			log.Printf("[imap] check attachment existence error: %v", err)
 		}
 		if exists {
-			continue
+			id = existingID
+		} else {
+			newID, err := w.db.InsertAttachment(att)
+			if err != nil {
+				log.Printf("[imap] save attachment to db error: %v", err)
+				continue
+			}
+			id = newID
+			savedCount++
+			log.Printf("[imap] archived attachment id=%d filename=%q size=%d bytes", id, att.Filename, att.FileSize)
 		}
-
-		id, err := w.db.InsertAttachment(att)
-		if err != nil {
-			log.Printf("[imap] save attachment to db error: %v", err)
-			continue
-		}
-		savedCount++
-		log.Printf("[imap] archived attachment id=%d filename=%q size=%d bytes", id, att.Filename, att.FileSize)
 
 		// Assignment rule matching & overwrite update mechanism
 		if w.rules != nil {

@@ -217,16 +217,21 @@ func (d *DB) GetAttachmentByID(id int64) (*Attachment, error) {
 }
 
 func (d *DB) ExistsByMessageAndFilename(messageID, filename string) (bool, error) {
-	query := `SELECT 1 FROM attachments WHERE message_id = ? AND filename = ? LIMIT 1`
-	var dummy int
-	err := d.conn.QueryRow(query, messageID, filename).Scan(&dummy)
+	_, exists, err := d.GetAttachmentIDByMessageAndFilename(messageID, filename)
+	return exists, err
+}
+
+func (d *DB) GetAttachmentIDByMessageAndFilename(messageID, filename string) (int64, bool, error) {
+	query := `SELECT id FROM attachments WHERE message_id = ? AND filename = ? LIMIT 1`
+	var id int64
+	err := d.conn.QueryRow(query, messageID, filename).Scan(&id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
+			return 0, false, nil
 		}
-		return false, fmt.Errorf("db: exists query: %w", err)
+		return 0, false, fmt.Errorf("db: exists query: %w", err)
 	}
-	return true, nil
+	return id, true, nil
 }
 
 func (d *DB) ListAttachments(filter AttachmentFilter) ([]*Attachment, int64, error) {
