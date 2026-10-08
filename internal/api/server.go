@@ -459,7 +459,17 @@ func (s *Server) handleAssignmentExportZip(w http.ResponseWriter, r *http.Reques
 			entryName = fmt.Sprintf("%s-%s.zip", sub.StudentID, sub.StudentName)
 		}
 
-		fw, err := zw.Create(entryName)
+		fi, statErr := file.Stat()
+		header := &zip.FileHeader{
+			Name:   entryName,
+			Method: zip.Deflate,
+		}
+		header.Flags |= 0x800 // UTF-8 filename flag (EFS: Bit 11 of general purpose flag)
+		if statErr == nil {
+			header.SetModTime(fi.ModTime())
+		}
+
+		fw, err := zw.CreateHeader(header)
 		if err != nil {
 			file.Close()
 			continue

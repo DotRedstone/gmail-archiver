@@ -69,10 +69,7 @@ func NewEngine(baseDir string) *Engine {
 
 // [Load]
 func (e *Engine) LoadRuleFile(rulePath string) (*AssignmentRule, error) {
-	absRulePath := rulePath
-	if !filepath.IsAbs(rulePath) {
-		absRulePath = filepath.Join(e.baseDir, rulePath)
-	}
+	absRulePath := resolvePath(e.baseDir, rulePath)
 
 	data, err := os.ReadFile(absRulePath)
 	if err != nil {
@@ -130,10 +127,7 @@ func (e *Engine) LoadRuleFile(rulePath string) (*AssignmentRule, error) {
 
 	// Load associated roster CSV files
 	for _, rp := range raw.Rosters {
-		absRoster := rp
-		if !filepath.IsAbs(rp) {
-			absRoster = filepath.Join(e.baseDir, rp)
-		}
+		absRoster := resolveRosterPath(filepath.Dir(absRulePath), e.baseDir, rp)
 		if _, err := rule.Roster.LoadCSV(absRoster); err != nil {
 			return nil, fmt.Errorf("rule: load roster %q: %w", absRoster, err)
 		}
@@ -307,4 +301,39 @@ func extractNamedGroups(re *regexp.Regexp, s string) map[string]string {
 		}
 	}
 	return result
+}
+
+func resolvePath(baseDir, p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	cand := filepath.Join(baseDir, p)
+	if _, err := os.Stat(cand); err == nil {
+		return cand
+	}
+	return cand
+}
+
+func resolveRosterPath(ruleDir, baseDir, p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	// Try relative to rule file directory
+	candRule := filepath.Join(ruleDir, p)
+	if _, err := os.Stat(candRule); err == nil {
+		return candRule
+	}
+	// Try relative to baseDir
+	candBase := filepath.Join(baseDir, p)
+	if _, err := os.Stat(candBase); err == nil {
+		return candBase
+	}
+	// Try relative to current working directory
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	return candBase
 }
