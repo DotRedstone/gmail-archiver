@@ -13,7 +13,7 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.message_components import File, At, Plain
 
 API_BASE = "https://gmail.bdot.in"
-ADMIN_QQ_LIST = ["1689491386"]  # 助教与管理员 QQ
+SUPER_ADMIN_QQ = "1689491386"  # 固定超级管理员 Owner
 
 # 交互会话缓存：(sender_id, group_id) -> {"time": float, "type": str, ...}
 PENDING_SESSIONS = {}
@@ -50,13 +50,20 @@ def make_reply(event: AstrMessageEvent, text: str):
     return event.plain_result(text)
 
 def load_config() -> dict:
+    default_cfg = {
+        "class_groups": [],
+        "teaching_assistants": [],
+    }
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data, dict):
+                    default_cfg.update(data)
+                    return default_cfg
         except Exception:
             pass
-    return {"class_groups": []}
+    return default_cfg
 
 def save_config(cfg: dict):
     try:
@@ -88,14 +95,47 @@ def remove_class_group(group_id: str) -> bool:
         return True
     return False
 
-def is_admin(event: AstrMessageEvent) -> bool:
-    sender_id = str(event.get_sender_id())
-    if sender_id in ADMIN_QQ_LIST:
-        return True
-    sender_obj = getattr(event.message_obj, "sender", None)
-    if sender_obj and getattr(sender_obj, "role", "") in ["owner", "admin"]:
+def get_teaching_assistants() -> list:
+    return [str(q) for q in load_config().get("teaching_assistants", [])]
+
+def add_teaching_assistant(qq_id: str) -> bool:
+    qq = str(qq_id).strip()
+    if not qq.isdigit():
+        return False
+    cfg = load_config()
+    tas = [str(q) for q in cfg.get("teaching_assistants", [])]
+    if qq not in tas:
+        tas.append(qq)
+        cfg["teaching_assistants"] = tas
+        save_config(cfg)
         return True
     return False
+
+def remove_teaching_assistant(qq_id: str) -> bool:
+    qq = str(qq_id).strip()
+    cfg = load_config()
+    tas = [str(q) for q in cfg.get("teaching_assistants", [])]
+    if qq in tas:
+        tas.remove(qq)
+        cfg["teaching_assistants"] = tas
+        save_config(cfg)
+        return True
+    return False
+
+def is_super_admin(event: AstrMessageEvent) -> bool:
+    """是否为超级管理员（1689491386）"""
+    return str(event.get_sender_id() or "") == SUPER_ADMIN_QQ
+
+def is_ta_or_admin(event: AstrMessageEvent) -> bool:
+    """是否为助教或超级管理员（拥有查任意人、下载作业、查重权限）"""
+    sender_id = str(event.get_sender_id() or "")
+    if sender_id == SUPER_ADMIN_QQ:
+        return True
+    return sender_id in get_teaching_assistants()
+
+def is_admin(event: AstrMessageEvent) -> bool:
+    """兼容旧接口：代理到 is_ta_or_admin"""
+    return is_ta_or_admin(event)
 
 def api_get(endpoint: str):
     url = f"{API_BASE}{endpoint}"
@@ -325,7 +365,12 @@ async def build_student_status_card(student_id: str, student_name: str, class_na
     """生成学生个人作业查收/提交状态汇总卡片"""
     try:
         assignments_resp = await async_api_get("/api/assignments")
-        assignments = assignments_resp.get("assignments", [])
+        if isinstance(assignments_resp, list):
+            assignments = assignments_resp
+        elif isinstance(assignments_resp, dict):
+            assignments = assignments_resp.get("assignments", [])
+        else:
+            assignments = []
     except Exception:
         assignments = []
 
@@ -559,7 +604,20 @@ class HomeworkPlugin(Star):
         if not assignments:
             return "未能获取到当前作业列表。"
 
+        sender_id = str(event.get_sender_id() or "")
         student_query = student_name_or_id.strip()
+
+        if not is_ta_or_admin(event):
+            try:
+                b_info = await async_api_get(f"/api/bindings/{sender_id}")
+            except Exception:
+                b_info = {}
+            if b_info.get("error"):
+                return "权限不足：未绑定身份的学生无法查询作业。请先发送 /绑定 学号 姓名。"
+            my_sid = str(b_info.get("student_id", "")).strip()
+            my_name = str(b_info.get("student_name", "")).strip()
+            if student_query != my_sid and student_query != my_name:
+                return "权限不足：为保护同学个人隐私，普通学生仅可查询本人的作业状态，无法跨人查询其他同学。"
 
         results = []
         for a in assignments:
@@ -616,22 +674,24 @@ class HomeworkPlugin(Star):
         msg = (
             "📖【并行计算课程 · 作业助手指南】\n"
             "━━━━━━━━━━━━━━━\n"
-            "💡 提示：日常无需输入斜杠「/」，直接自然提问或发送口令即可！\n\n"
-            "🔹 常用口语与快捷查询（群聊/私聊均可）：\n"
-            "1️⃣「看看我交了吗？」或「我交了吗」—— 自动识别身份并播报个人作业归档状态\n"
-            "2️⃣「查作业」—— 查看当前作业提交总人数与比例概览\n"
-            "3️⃣「未交」—— 查看未交作业学生名单\n"
-            "4️⃣「我的信息」—— 查看当前绑定的学号、姓名与班级\n\n"
-            "🔹 作业提交与身份通道：\n"
-            "5️⃣ 私聊直接发作业压缩包 —— 自动识别身份，秒级规范命名并安全归档\n"
-            "6️⃣ 绑定 <学号> [姓名] —— 绑定学生身份（例：绑定 240809010501 支全振）\n"
-            "7️⃣ 查收 <姓名或学号> —— 自助查验指定同学作业（例：查收 支全振）\n\n"
-            "👑 助教/管理员专属：\n"
-            "8️⃣ 私聊发实验卡文件 —— 自动提取实验号并一键分发群文件与广播\n"
-            "9️⃣ 导出作业 / 导出整学期 —— 一键打包下载全量作业归档压缩包\n"
-            "🔟 设为班级群 —— 在群内执行，将当前群标记为作业通告群\n"
-            "1️⃣1️⃣ 绑定列表 —— 查看所有已绑定的学生统计清单\n"
-            "1️⃣2️⃣ 查重 [序号] —— 查看代码哈希查重与学术诚信雷同报表"
+            "💡 提示：日常无需输入斜杠「/」，直接自然提问或发送快捷口令即可！\n\n"
+            "🎓【学生日常功能】（群聊/私聊均可）：\n"
+            "1️⃣「看看我交了吗？」或「查收」—— 自动核对个人作业归档状态\n"
+            "2️⃣ 私聊直接发作业压缩包 —— 自动识别身份，秒级规范命名并安全归档入库\n"
+            "3️⃣「查作业」—— 查看作业提交人数与整体进度\n"
+            "4️⃣「未交」—— 查看当前未交作业名单\n"
+            "5️⃣ 绑定 <学号> [姓名] —— 绑定学生身份（例：绑定 240809010501 支全振）\n"
+            "6️⃣「我的信息」—— 查看当前绑定的学号、姓名与班级\n\n"
+            "👑【助教/管理员专属】：\n"
+            "• 查收 <姓名或学号> —— 直接查询指定同学作业（例：查收 支全振）\n"
+            "• 导出作业 / 导出整学期 —— 打包下载全员作业归档压缩包\n"
+            "• 一键查重 / 查重 [序号] —— 全员代码哈希指纹查重，排查抄袭嫌疑\n"
+            "• 私聊发实验卡文件 —— 自动提取实验号并一键分发群文件与广播\n"
+            "• 设为班级群 —— 在群内执行，将当前群标记为作业通告群\n"
+            "• 助教列表 —— 查看教学管理团队人员\n\n"
+            "👑【超级管理员专属】：\n"
+            "• 添加助教 <QQ> —— 任命新的课程助教\n"
+            "• 移除助教 <QQ> —— 移除指定的课程助教"
         )
         yield make_reply(event, msg)
 
@@ -805,6 +865,77 @@ class HomeworkPlugin(Star):
 
         yield make_reply(event, "📢 当前已配置的并行计算通告群：\n" + "\n".join([f"• 群号：{g}" for g in groups]))
 
+    # ---------------- 助教团队与权限管理 ----------------
+    @filter.command("添加助教")
+    async def add_ta_cmd(self, event: AstrMessageEvent, qq: str = ""):
+        """【管理员专属】添加助教：/添加助教 <QQ号>"""
+        if not is_super_admin(event):
+            yield make_reply(event, "❌ 权限不足：仅超级管理员可任命助教。")
+            return
+        qq = qq.strip()
+        if not qq.isdigit():
+            yield make_reply(event, "⚠️ 请提供有效的纯数字 QQ 号，例如：/添加助教 3293421754")
+            return
+        if qq == SUPER_ADMIN_QQ:
+            yield make_reply(event, "ℹ️ 该账号已是超级管理员，无需重复添加。")
+            return
+
+        name_info = ""
+        try:
+            b = await async_api_get(f"/api/bindings/{qq}")
+            if not b.get("error"):
+                name_info = f"（{b.get('student_name', '')}同学，{b.get('class_name', '')}）"
+        except Exception:
+            pass
+
+        if add_teaching_assistant(qq):
+            yield make_reply(event, f"✅ 成功添加助教：QQ {qq}{name_info}！\n该助教现已具备查询全员作业、导出下载作业及一键查重的权限。")
+        else:
+            yield make_reply(event, f"ℹ️ QQ {qq} 已在助教列表中。")
+
+    @filter.command("移除助教")
+    async def remove_ta_cmd(self, event: AstrMessageEvent, qq: str = ""):
+        """【管理员专属】移除助教：/移除助教 <QQ号>"""
+        if not is_super_admin(event):
+            yield make_reply(event, "❌ 权限不足：仅超级管理员可移除助教。")
+            return
+        qq = qq.strip()
+        if not qq:
+            yield make_reply(event, "⚠️ 请指定要移除的助教 QQ 号，例如：/移除助教 3293421754")
+            return
+        if remove_teaching_assistant(qq):
+            yield make_reply(event, f"✅ 已成功移除助教：QQ {qq}。")
+        else:
+            yield make_reply(event, f"⚠️ 未在助教列表中找到 QQ {qq}。")
+
+    @filter.command("助教列表")
+    async def list_ta_cmd(self, event: AstrMessageEvent):
+        """查看当前配置的助教团队列表"""
+        if not is_ta_or_admin(event):
+            yield make_reply(event, "❌ 权限不足：仅助教或管理员可查看助教名单。")
+            return
+        tas = get_teaching_assistants()
+        lines = [
+            "👥【并行计算课程 · 教学管理团队】",
+            "━━━━━━━━━━━━━━━",
+            f"👑 超级管理员：QQ {SUPER_ADMIN_QQ}",
+        ]
+        if tas:
+            lines.append("🎓 课程助教：")
+            for idx, q in enumerate(tas, 1):
+                name_str = ""
+                try:
+                    b = await async_api_get(f"/api/bindings/{q}")
+                    if not b.get("error"):
+                        name_str = f" - {b.get('student_name', '')}（{b.get('class_name', '')}）"
+                except Exception:
+                    pass
+                lines.append(f"  {idx}. QQ {q}{name_str}")
+        else:
+            lines.append("🎓 课程助教：（暂未配置，管理员可发送 /添加助教 <QQ> 添加）")
+        lines.append("━━━━━━━━━━━━━━━")
+        yield make_reply(event, "\n".join(lines))
+
     # ---------------- 作业查询与统计 ----------------
     @filter.command("查作业")
     async def status_cmd(self, event: AstrMessageEvent, param: str = ""):
@@ -917,44 +1048,79 @@ class HomeworkPlugin(Star):
         """自助查询个人作业是否收到：/查收 张三 或 /查收 24080901xxxx [序号]"""
         query = query.strip()
         sender_id = str(event.get_sender_id())
+        is_ta = is_ta_or_admin(event)
 
-        # 若未带参数，尝试从绑定表中获取当前学生学号
-        if not query:
-            try:
-                bind_info = await async_api_get(f"/api/bindings/{sender_id}")
-                if not bind_info.get("error"):
-                    query = bind_info.get("student_id")
-            except Exception:
-                pass
-
-        if not query:
-            yield make_reply(event, "💡 用法：/查收 <姓名或学号> [作业序号]，例如：/查收 支全振 或 /查收 支全振 2\n（也可先使用 /绑定 后直接发送 /查收）")
-            return
+        # 获取当前发送者绑定信息
+        try:
+            bind_info = await async_api_get(f"/api/bindings/{sender_id}")
+        except Exception:
+            bind_info = {}
+        has_binding = not bind_info.get("error")
+        my_sid = str(bind_info.get("student_id", "")).strip()
+        my_name = str(bind_info.get("student_name", "")).strip()
 
         assignments = get_assignments()
         if not assignments:
             yield make_reply(event, "❌ 获取作业列表失败或当前未配置任何作业。")
             return
 
-        parts = query.split()
-        student_query = ""
         target_assignment = None
 
-        if len(parts) == 1:
-            student_query = parts[0]
+        if not query:
+            if not has_binding:
+                if is_ta:
+                    yield make_reply(event, "💡 用法：/查收 <姓名或学号> [作业序号]，例如：/查收 支全振 或 /查收 支全振 2")
+                else:
+                    yield make_reply(event, "💡 你尚未绑定学生身份。请先发送「/绑定 学号 姓名」完成绑定，或直接私聊发送作业压缩包。")
+                return
+            student_query = my_sid
         else:
-            p0, p1 = parts[0], parts[1]
-            a0 = match_assignment(p0, assignments)
-            a1 = match_assignment(p1, assignments)
-            if a0 and not a1:
-                target_assignment = a0
-                student_query = p1
-            elif a1 and not a0:
-                target_assignment = a1
-                student_query = p0
+            parts = query.split()
+            student_query = ""
+
+            if len(parts) == 1:
+                p0 = parts[0]
+                matched_a = match_assignment(p0, assignments)
+                if matched_a:
+                    target_assignment = matched_a
+                    if has_binding:
+                        student_query = my_sid
+                    else:
+                        if is_ta:
+                            yield make_reply(event, f"💡 请指定要查询的学生姓名或学号，例如：/查收 支全振 {p0}")
+                        else:
+                            yield make_reply(event, "💡 你尚未绑定学生身份。请先发送「/绑定 学号 姓名」完成绑定。")
+                        return
+                else:
+                    student_query = p0
             else:
-                student_query = p0
-                target_assignment = match_assignment(p1, assignments)
+                p0, p1 = parts[0], parts[1]
+                a0 = match_assignment(p0, assignments)
+                a1 = match_assignment(p1, assignments)
+                if a0 and not a1:
+                    target_assignment = a0
+                    student_query = p1
+                elif a1 and not a0:
+                    target_assignment = a1
+                    student_query = p0
+                else:
+                    student_query = p0
+                    target_assignment = match_assignment(p1, assignments)
+
+            # 核心权限鉴权：非助教/管理员严禁查询他人作业
+            if not is_ta:
+                if not has_binding:
+                    yield make_reply(event, 
+                        "❌ 权限不足：为保护同学隐私，仅课程助教可查询他人作业。\n"
+                        "💡 请先发送「/绑定 学号 姓名」完成绑定后直接发送「/查收」。"
+                    )
+                    return
+                if student_query != my_sid and student_query != my_name:
+                    yield make_reply(event, 
+                        "❌ 权限不足：为保护同学隐私，普通学生仅可查询本人的作业提交状态。\n"
+                        "💡 请直接发送「/查收」或「看看我交了吗」查看自己的作业。"
+                    )
+                    return
 
         check_list = [target_assignment] if target_assignment else assignments
         is_single = bool(target_assignment)
@@ -1092,10 +1258,10 @@ class HomeworkPlugin(Star):
             yield res
 
     # ---------------- 代码查重模块 ----------------
-    @filter.command("查重", alias={"代码查重", "学术诚信"})
+    @filter.command("查重", alias={"代码查重", "学术诚信", "一键查重", "查抄袭"})
     async def plagiarism_cmd(self, event: AstrMessageEvent, param: str = ""):
-        """管理员查看作业哈希查重报告：/查重 或 /查重 2"""
-        if not is_admin(event):
+        """助教与管理员查看作业哈希查重报告：/查重 或 /查重 2"""
+        if not is_ta_or_admin(event):
             yield make_reply(event, "❌ 权限不足：代码查重仅限课程助教或管理员执行。")
             return
 
@@ -1105,42 +1271,87 @@ class HomeworkPlugin(Star):
             return
 
         param = param.strip()
-        target = match_assignment(param, assignments) if param else (assignments[0] if len(assignments) == 1 else assignments[-1])
-        if not target:
-            target = assignments[-1]
 
-        try:
-            data = api_get(f"/api/assignments/{target['id']}/plagiarism")
-        except Exception as e:
-            yield make_reply(event, f"❌ 获取查重数据失败: {e}")
+        # 模式 1：指定了具体某次作业（如 /查重 1 或 /查重 实验2）
+        if param and param not in ["全部", "all"]:
+            target = match_assignment(param, assignments)
+            if not target:
+                opts = "、".join([f"{i}.{a['name']}" for i, a in enumerate(assignments, 1)])
+                yield make_reply(event, f"⚠️ 未找到与 [{param}] 匹配的作业。\n当前可选作业：{opts}")
+                return
+
+            try:
+                data = api_get(f"/api/assignments/{target['id']}/plagiarism")
+            except Exception as e:
+                yield make_reply(event, f"❌ 获取查重数据失败: {e}")
+                return
+
+            pairs = data.get("pairs", [])
+            a_name = data.get("assignment_name", target.get("name", ""))
+
+            if not pairs:
+                yield make_reply(event, 
+                    f"🎉【{a_name} · 代码哈希查重报告】\n"
+                    "━━━━━━━━━━━━━━━\n"
+                    "✅ 全员代码哈希指纹校验通过，未检出整包复制或换壳抄袭记录。"
+                )
+                return
+
+            lines = [
+                f"🔍【{a_name} · 代码哈希查重报告】",
+                "━━━━━━━━━━━━━━━",
+                f"⚠️ 共检出 {len(pairs)} 组雷同嫌疑记录：",
+            ]
+            for idx, p in enumerate(pairs, 1):
+                p_type = "整包直接复制（压缩包完全一致）" if p.get("duplicate_type") == "exact_archive" else "换壳抄袭（核心源代码完全一致）"
+                f_str = "、".join(p.get("identical_files", []))
+                lines.append(f"{idx}️⃣ {p['student_a_name']}（{p['student_a']}）↔ {p['student_b_name']}（{p['student_b']}）")
+                lines.append(f"    • 判定类型：{p_type}")
+                lines.append(f"    • 碰撞源码：{f_str}")
+
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append("💡 建议助教与上述同学核实源码实现与提交情况。")
+            yield make_reply(event, "\n".join(lines))
             return
 
-        pairs = data.get("pairs", [])
-        a_name = data.get("assignment_name", target.get("name", ""))
-
-        if not pairs:
-            yield make_reply(event, 
-                f"🎉【{a_name} · 代码哈希查重报告】\n"
-                "━━━━━━━━━━━━━━━\n"
-                "✅ 全员代码哈希指纹校验通过，未检出整包复制或换壳抄袭记录。"
-            )
-            return
-
-        lines = [
-            f"🔍【{a_name} · 代码哈希查重报告】",
+        # 模式 2：未指定作业（一键全员全作业查重）
+        total_suspect_pairs = 0
+        summary_lines = [
+            "🔍【并行计算课程 · 全员代码哈希查重报告】",
             "━━━━━━━━━━━━━━━",
-            f"⚠️ 共检出 {len(pairs)} 组雷同嫌疑记录：",
         ]
-        for idx, p in enumerate(pairs, 1):
-            p_type = "整包直接复制（压缩包完全一致）" if p.get("duplicate_type") == "exact_archive" else "换壳抄袭（核心源代码完全一致）"
-            f_str = "、".join(p.get("identical_files", []))
-            lines.append(f"{idx}️⃣ {p['student_a_name']}（{p['student_a']}）↔ {p['student_b_name']}（{p['student_b']}）")
-            lines.append(f"    • 判定类型：{p_type}")
-            lines.append(f"    • 碰撞源码：{f_str}")
+        detail_blocks = []
 
-        lines.append("━━━━━━━━━━━━━━━")
-        lines.append("💡 建议助教与上述同学核实源码实现与提交情况。")
-        yield make_reply(event, "\n".join(lines))
+        for idx, a in enumerate(assignments, 1):
+            try:
+                data = api_get(f"/api/assignments/{a['id']}/plagiarism")
+                pairs = data.get("pairs", [])
+                a_name = data.get("assignment_name", a.get("name", ""))
+                if pairs:
+                    total_suspect_pairs += len(pairs)
+                    summary_lines.append(f"⚠️ {idx}️⃣ {a_name}：检出 {len(pairs)} 组雷同嫌疑！")
+                    block = [f"📌【{a_name} 雷同明细】："]
+                    for p_idx, p in enumerate(pairs, 1):
+                        p_type = "整包直接复制" if p.get("duplicate_type") == "exact_archive" else "换壳抄袭"
+                        f_str = "、".join(p.get("identical_files", []))
+                        block.append(f"  {p_idx}. {p['student_a_name']}（{p['student_a']}）↔ {p['student_b_name']}（{p['student_b']}） [{p_type}]")
+                        block.append(f"     碰撞源码：{f_str}")
+                    detail_blocks.append("\n".join(block))
+                else:
+                    summary_lines.append(f"✅ {idx}️⃣ {a_name}：指纹校验通过（0 组雷同）")
+            except Exception as e:
+                summary_lines.append(f"❓ {idx}️⃣ {a.get('name', '')}：查重查询失败 ({e})")
+
+        summary_lines.append("━━━━━━━━━━━━━━━")
+        if total_suspect_pairs == 0:
+            summary_lines.append("🎉 当前全部实验指纹校验通过，未检出整包复制或换壳抄袭行为。")
+        else:
+            summary_lines.append(f"⚠️ 全学期累计发现 {total_suspect_pairs} 组疑似抄袭，明细如下：\n")
+            summary_lines.extend(detail_blocks)
+            summary_lines.append("\n━━━━━━━━━━━━━━━\n💡 建议助教与上述同学核实源码与提交记录。")
+
+        summary_lines.append("💡 提示：如需单独查看某次作业详情，可发送：/查重 1")
+        yield make_reply(event, "\n".join(summary_lines))
 
     # ---------------- 消息与文件事件监听 ----------------
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL, priority=1)
@@ -1567,6 +1778,9 @@ class HomeworkPlugin(Star):
             event.stop_event()
 
             if s_type == "export":
+                if not is_ta_or_admin(event):
+                    await reply("❌ 权限不足：作业归档导出仅限课程助教或管理员执行。")
+                    return
                 url, filename, display_name = options[text]
                 async for res in upload_file_action(event, url, filename, display_name):
                     await reply(res)
@@ -1620,6 +1834,32 @@ class HomeworkPlugin(Star):
             async for r in self.unbind_student(event):
                 await reply(r)
             return
+        elif clean_text in ["查重", "代码查重", "一键查重", "学术诚信", "查抄袭"]:
+            event.stop_event()
+            async for r in self.plagiarism_cmd(event):
+                await reply(r)
+            return
+        elif clean_text.startswith("查重 ") or clean_text.startswith("代码查重 ") or clean_text.startswith("一键查重 "):
+            event.stop_event()
+            p = clean_text.split(maxsplit=1)[1]
+            async for r in self.plagiarism_cmd(event, p):
+                await reply(r)
+            return
+        elif clean_text in ["导出作业", "下载作业"]:
+            event.stop_event()
+            async for r in self.export_cmd(event):
+                await reply(r)
+            return
+        elif clean_text in ["导出整学期", "导出全部作业", "下载全部作业"]:
+            event.stop_event()
+            async for r in self.export_all_direct_cmd(event):
+                await reply(r)
+            return
+        elif clean_text in ["助教列表", "助教团队"]:
+            event.stop_event()
+            async for r in self.list_ta_cmd(event):
+                await reply(r)
+            return
         elif clean_text.startswith("绑定 ") or clean_text.startswith("绑定:"):
             event.stop_event()
             param = clean_text.split(maxsplit=1)[1] if " " in clean_text else clean_text.split(":", 1)[1]
@@ -1630,6 +1870,11 @@ class HomeworkPlugin(Star):
             event.stop_event()
             param = clean_text.split(maxsplit=1)[1]
             async for r in self.check_student(event, param):
+                await reply(r)
+            return
+        elif clean_text in ["查收", "查我", "我的作业"]:
+            event.stop_event()
+            async for r in self.check_student(event, ""):
                 await reply(r)
             return
 
