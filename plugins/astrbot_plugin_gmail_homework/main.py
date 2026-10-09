@@ -12,8 +12,6 @@ from astrbot.api.star import register, Star
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.message_components import File, At, Plain
 
-TA_STUDENT_ID = "240809010505"  # 明航宇（助教本人豁免）
-TA_NAME = "明航宇"
 API_BASE = "https://gmail.bdot.in"
 ADMIN_QQ_LIST = ["1689491386"]  # 助教与管理员 QQ
 
@@ -29,7 +27,7 @@ MAX_PROMPT_CHARS = 1500  # 单次提问最大字符数
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "plugin_config.json")
 
-HOMEWORK_SYSTEM_PROMPT = """你是由助教明航宇配置的《并行计算》课程作业助手。
+HOMEWORK_SYSTEM_PROMPT = """你是《并行计算》课程作业助手。
 【核心职责】：
 1. 专注于课程作业的发布指引、提交收集与状态核验。
 2. 作业提交方式：指导学生直接私聊发送作业压缩包（.zip / .rar / .7z / .tar.gz），系统将自动核验并归档入库。
@@ -287,13 +285,12 @@ def render_status_card(data: dict) -> str:
 def render_missing_list(data: dict) -> str:
     """生成单次作业未交学生名单（规范通告语言）"""
     missing = data.get("missing_list") or []
-    real_missing = [s for s in missing if s.get("student_id") != TA_STUDENT_ID and s.get("name") != TA_NAME]
     
-    if not real_missing:
-        return f"🎉【{data['assignment_name']}】除助教本人外，全员均已按时提交完成！"
+    if not missing:
+        return f"🎉【{data['assignment_name']}】全员均已按时提交完成！"
 
-    lines = [f"📢【{data['assignment_name']}】未交作业学生名单（共 {len(real_missing)} 人）：", "━━━━━━━━━━━━━━━"]
-    for idx, s in enumerate(real_missing, 1):
+    lines = [f"📢【{data['assignment_name']}】未交作业学生名单（共 {len(missing)} 人）：", "━━━━━━━━━━━━━━━"]
+    for idx, s in enumerate(missing, 1):
         cl = format_class_name(s.get("class_name", ""), s.get("student_id", ""))
         lines.append(f"{idx}. {s['name']}（{s['student_id']}，{cl}）")
     lines.append("━━━━━━━━━━━━━━━\n💡 提醒：请以上同学抓紧整理源码与实验报告，直接私聊机器人发送作业压缩包即可自动归档提交。")
@@ -334,9 +331,6 @@ async def build_student_status_card(student_id: str, student_name: str, class_na
 
     if not assignments:
         return "❌ 获取作业列表失败或当前未发布任何作业。"
-
-    if student_id == TA_STUDENT_ID or student_name == TA_NAME:
-        return f"👑 {TA_NAME} 为课程助教，无需提交作业哦~"
 
     results = []
     for a in assignments:
@@ -566,8 +560,6 @@ class HomeworkPlugin(Star):
             return "未能获取到当前作业列表。"
 
         student_query = student_name_or_id.strip()
-        if student_query in [TA_STUDENT_ID, TA_NAME]:
-            return f"{TA_NAME} 为课程助教，无需提交作业。"
 
         results = []
         for a in assignments:
@@ -963,10 +955,6 @@ class HomeworkPlugin(Star):
             else:
                 student_query = p0
                 target_assignment = match_assignment(p1, assignments)
-
-        if student_query in [TA_STUDENT_ID, TA_NAME]:
-            yield make_reply(event, f"👑 {TA_NAME} 为课程助教，无需提交作业。")
-            return
 
         check_list = [target_assignment] if target_assignment else assignments
         is_single = bool(target_assignment)
