@@ -1,7 +1,9 @@
 package api
 
 import (
+	"archive/tar"
 	"archive/zip"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,9 +15,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"golang.org/x/text/encoding/simplifiedchinese"
 
 	"github.com/dot/gmail-archiver/internal/config"
 	"github.com/dot/gmail-archiver/internal/db"
@@ -491,34 +495,29 @@ func (s *Server) handleAssignmentExportZip(w http.ResponseWriter, r *http.Reques
 			continue
 		}
 
-		file, err := os.Open(absPath)
-		if err != nil {
-			continue
+		className := roster.NormalizeClassName(sub.ClassName)
+		if className == "" {
+			if strings.HasPrefix(sub.StudentID, "2408090105") {
+				className = "245班"
+			} else if strings.HasPrefix(sub.StudentID, "2408090121") || sub.StudentID == "240810010303" {
+				className = "24绿算"
+			}
 		}
 
-		entryName := sub.TargetFilename
-		if entryName == "" {
-			entryName = fmt.Sprintf("%s-%s.zip", sub.StudentID, sub.StudentName)
+		studentFolder := fmt.Sprintf("%s-%s", sub.StudentID, sub.StudentName)
+		var targetDir string
+		if className != "" {
+			targetDir = fmt.Sprintf("%s/%s", className, studentFolder)
+		} else {
+			targetDir = studentFolder
 		}
 
-		fi, statErr := file.Stat()
-		header := &zip.FileHeader{
-			Name:   entryName,
-			Method: zip.Deflate,
-		}
-		header.Flags |= 0x800 // UTF-8 filename flag
-		if statErr == nil {
-			header.SetModTime(fi.ModTime())
+		fallbackName := sub.TargetFilename
+		if fallbackName == "" {
+			fallbackName = fmt.Sprintf("%s-%s.zip", sub.StudentID, sub.StudentName)
 		}
 
-		fw, err := zw.CreateHeader(header)
-		if err != nil {
-			file.Close()
-			continue
-		}
-
-		_, _ = io.Copy(fw, file)
-		file.Close()
+		_ = writeSubmissionFilesToZip(zw, absPath, targetDir, fallbackName)
 	}
 }
 
@@ -595,11 +594,6 @@ func (s *Server) handleSemesterExportZip(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 
-		file, err := os.Open(absPath)
-		if err != nil {
-			continue
-		}
-
 		dirName := sub.AssignmentID
 		if s.rules != nil {
 			if rule, ok := s.rules.GetRule(sub.AssignmentID); ok && rule.Name != "" {
@@ -608,31 +602,29 @@ func (s *Server) handleSemesterExportZip(w http.ResponseWriter, r *http.Request)
 		}
 		dirName = strings.ReplaceAll(dirName, "/", "_")
 
-		entryName := sub.TargetFilename
-		if entryName == "" {
-			entryName = fmt.Sprintf("%s-%s.zip", sub.StudentID, sub.StudentName)
+		className := roster.NormalizeClassName(sub.ClassName)
+		if className == "" {
+			if strings.HasPrefix(sub.StudentID, "2408090105") {
+				className = "245班"
+			} else if strings.HasPrefix(sub.StudentID, "2408090121") || sub.StudentID == "240810010303" {
+				className = "24绿算"
+			}
 		}
 
-		fullEntryPath := fmt.Sprintf("%s/%s", dirName, entryName)
-
-		fi, statErr := file.Stat()
-		header := &zip.FileHeader{
-			Name:   fullEntryPath,
-			Method: zip.Deflate,
-		}
-		header.Flags |= 0x800 // UTF-8 filename flag
-		if statErr == nil {
-			header.SetModTime(fi.ModTime())
+		studentFolder := fmt.Sprintf("%s-%s", sub.StudentID, sub.StudentName)
+		var targetDir string
+		if className != "" {
+			targetDir = fmt.Sprintf("%s/%s/%s", dirName, className, studentFolder)
+		} else {
+			targetDir = fmt.Sprintf("%s/%s", dirName, studentFolder)
 		}
 
-		fw, err := zw.CreateHeader(header)
-		if err != nil {
-			file.Close()
-			continue
+		fallbackName := sub.TargetFilename
+		if fallbackName == "" {
+			fallbackName = fmt.Sprintf("%s-%s.zip", sub.StudentID, sub.StudentName)
 		}
 
-		_, _ = io.Copy(fw, file)
-		file.Close()
+		_ = writeSubmissionFilesToZip(zw, absPath, targetDir, fallbackName)
 	}
 }
 
@@ -663,47 +655,234 @@ func (s *Server) handleStudentAllAssignmentsExportZip(w http.ResponseWriter, r *
 	zw := zip.NewWriter(w)
 	defer zw.Close()
 
-	seenNames := make(map[string]int)
 	for _, sub := range subs {
 		absPath, err := s.storage.ResolveAbsolutePath(sub.StoragePath)
 		if err != nil {
 			continue
 		}
 
-		file, err := os.Open(absPath)
+		dirName := sub.AssignmentID
+		if s.rules != nil {
+			if rule, ok := s.rules.GetRule(sub.AssignmentID); ok && rule.Name != "" {
+				dirName = rule.Name
+			}
+		}
+		dirName = strings.ReplaceAll(dirName, "/", "_")
+		targetDir := dirName
+
+		fallbackName := sub.TargetFilename
+		if fallbackName == "" {
+			fallbackName = fmt.Sprintf("%s_%s_%s.zip", sub.AssignmentID, sub.StudentID, sub.StudentName)
+		}
+
+		_ = writeSubmissionFilesToZip(zw, absPath, targetDir, fallbackName)
+	}
+}
+
+// [ExportZipHelpers]
+// writeSubmissionFilesToZip extracts inner files if the submission is a zip/tar archive,
+// placing each file under studentTargetFolder/<inner_file>.
+// If it is not an archive or extraction fails, it places the raw file under studentTargetFolder/<fallbackFilename>.
+func writeSubmissionFilesToZip(zw *zip.Writer, absPath string, studentTargetFolder string, fallbackFilename string) error {
+	fi, err := os.Stat(absPath)
+	if err != nil {
+		return err
+	}
+
+	lower := strings.ToLower(absPath)
+
+	// 1. Try extracting zip
+	if strings.HasSuffix(lower, ".zip") {
+		zr, err := zip.OpenReader(absPath)
+		if err == nil {
+			defer zr.Close()
+			commonPrefix := detectCommonDirPrefix(zr.File)
+			extractedCount := 0
+
+			for _, f := range zr.File {
+				if f.FileInfo().IsDir() {
+					continue
+				}
+				cleanName := filepath.ToSlash(decodeZipFilename(f))
+				if verifier.IsIgnoredPath(cleanName) {
+					continue
+				}
+				if commonPrefix != "" && strings.HasPrefix(cleanName, commonPrefix) {
+					cleanName = strings.TrimPrefix(cleanName, commonPrefix)
+				}
+				cleanName = strings.TrimLeft(cleanName, "/")
+				if cleanName == "" {
+					continue
+				}
+
+				cleanName = filepath.Clean(cleanName)
+				if strings.HasPrefix(cleanName, "..") {
+					continue
+				}
+
+				rc, err := f.Open()
+				if err != nil {
+					continue
+				}
+
+				entryPath := fmt.Sprintf("%s/%s", studentTargetFolder, cleanName)
+				header := &zip.FileHeader{
+					Name:   entryPath,
+					Method: zip.Deflate,
+				}
+				header.Flags |= 0x800
+				header.SetModTime(f.Modified)
+
+				fw, err := zw.CreateHeader(header)
+				if err == nil {
+					_, _ = io.Copy(fw, rc)
+					extractedCount++
+				}
+				rc.Close()
+			}
+
+			if extractedCount > 0 {
+				return nil
+			}
+		}
+	}
+
+	// 2. Try extracting tar.gz / tgz / tar
+	if strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz") || strings.HasSuffix(lower, ".tar") {
+		extractedCount, err := extractTarToZip(zw, absPath, studentTargetFolder)
+		if err == nil && extractedCount > 0 {
+			return nil
+		}
+	}
+
+	// 3. Fallback: write the raw file into the student folder
+	file, err := os.Open(absPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	if fallbackFilename == "" {
+		fallbackFilename = filepath.Base(absPath)
+	}
+
+	entryPath := fmt.Sprintf("%s/%s", studentTargetFolder, fallbackFilename)
+	header := &zip.FileHeader{
+		Name:   entryPath,
+		Method: zip.Deflate,
+	}
+	header.Flags |= 0x800
+	header.SetModTime(fi.ModTime())
+
+	fw, err := zw.CreateHeader(header)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(fw, file)
+	return err
+}
+
+func decodeZipFilename(f *zip.File) string {
+	name := f.Name
+	if (f.Flags&0x800 != 0) && utf8.ValidString(name) {
+		return name
+	}
+	if utf8.ValidString(name) {
+		return name
+	}
+	decoded, err := simplifiedchinese.GB18030.NewDecoder().String(name)
+	if err == nil && utf8.ValidString(decoded) {
+		return decoded
+	}
+	return name
+}
+
+func detectCommonDirPrefix(files []*zip.File) string {
+	var prefix string
+	first := true
+	for _, f := range files {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		name := filepath.ToSlash(decodeZipFilename(f))
+		if verifier.IsIgnoredPath(name) {
+			continue
+		}
+		parts := strings.Split(name, "/")
+		if len(parts) <= 1 {
+			return ""
+		}
+		topDir := parts[0] + "/"
+		if first {
+			prefix = topDir
+			first = false
+		} else if prefix != topDir {
+			return ""
+		}
+	}
+	return prefix
+}
+
+func extractTarToZip(zw *zip.Writer, absPath string, studentTargetFolder string) (int, error) {
+	file, err := os.Open(absPath)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	var r io.Reader = file
+	lower := strings.ToLower(absPath)
+	if strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz") {
+		gzr, err := gzip.NewReader(file)
 		if err != nil {
+			return 0, err
+		}
+		defer gzr.Close()
+		r = gzr
+	}
+
+	tr := tar.NewReader(r)
+	extractedCount := 0
+
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			break
+		}
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
 			continue
 		}
 
-		entryName := sub.TargetFilename
-		if entryName == "" {
-			entryName = fmt.Sprintf("%s_%s_%s.zip", sub.AssignmentID, sub.StudentID, sub.StudentName)
+		cleanName := filepath.ToSlash(hdr.Name)
+		if verifier.IsIgnoredPath(cleanName) {
+			continue
+		}
+		cleanName = strings.TrimLeft(cleanName, "/")
+		cleanName = filepath.Clean(cleanName)
+		if strings.HasPrefix(cleanName, "..") || cleanName == "." || cleanName == "" {
+			continue
 		}
 
-		if seenNames[entryName] > 0 {
-			entryName = fmt.Sprintf("%s_%s", sub.AssignmentID, entryName)
-		}
-		seenNames[entryName]++
-
-		fi, statErr := file.Stat()
+		entryPath := fmt.Sprintf("%s/%s", studentTargetFolder, cleanName)
 		header := &zip.FileHeader{
-			Name:   entryName,
+			Name:   entryPath,
 			Method: zip.Deflate,
 		}
-		header.Flags |= 0x800 // UTF-8 filename flag
-		if statErr == nil {
-			header.SetModTime(fi.ModTime())
-		}
+		header.Flags |= 0x800
+		header.SetModTime(hdr.ModTime)
 
 		fw, err := zw.CreateHeader(header)
 		if err != nil {
-			file.Close()
 			continue
 		}
-
-		_, _ = io.Copy(fw, file)
-		file.Close()
+		_, _ = io.Copy(fw, tr)
+		extractedCount++
 	}
+
+	return extractedCount, nil
 }
 
 // [StudentBindingsHandlers]

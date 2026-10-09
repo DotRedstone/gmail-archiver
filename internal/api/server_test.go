@@ -251,6 +251,24 @@ target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
 		t.Errorf("expected application/zip, got %s", recExport.Header().Get("Content-Type"))
 	}
 
+	expZipReader, err := zip.NewReader(bytes.NewReader(recExport.Body.Bytes()), int64(recExport.Body.Len()))
+	if err != nil {
+		t.Fatalf("failed to read exported zip: %v", err)
+	}
+	if len(expZipReader.File) == 0 {
+		t.Fatalf("expected at least 1 file in exported zip")
+	}
+	foundStudentFolder := false
+	for _, f := range expZipReader.File {
+		if strings.Contains(f.Name, "240809010501-支全振") {
+			foundStudentFolder = true
+			break
+		}
+	}
+	if !foundStudentFolder {
+		t.Errorf("expected student folder in exported zip, got files: %+v", expZipReader.File)
+	}
+
 	// 11. Verify Web Docs endpoint / and /docs (public access)
 	for _, docPath := range []string{"/", "/docs"} {
 		reqDoc := httptest.NewRequest("GET", docPath, nil)

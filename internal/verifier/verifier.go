@@ -50,8 +50,8 @@ type PlagiarismCheckResult struct {
 	Message            string   `json:"message"`
 }
 
-// isIgnoredPath checks if a file is an OS artifact, IDE temp file, or directory entry.
-func isIgnoredPath(p string) bool {
+// IsIgnoredPath checks if a file is an OS artifact, IDE temp file, or directory entry.
+func IsIgnoredPath(p string) bool {
 	clean := filepath.ToSlash(p)
 	parts := strings.Split(clean, "/")
 	for _, part := range parts {
@@ -63,6 +63,10 @@ func isIgnoredPath(p string) bool {
 		}
 	}
 	return false
+}
+
+func isIgnoredPath(p string) bool {
+	return IsIgnoredPath(p)
 }
 
 // classifyFile identifies file type and determines if it is a core source implementation.
