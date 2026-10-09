@@ -173,6 +173,16 @@ def format_file_size(size_bytes: int) -> str:
     else:
         return f"{size_bytes / (1024 * 1024):.2f} MB"
 
+def extract_student_id(text: str) -> str:
+    """从文本中提取 10~13 位纯数字学号"""
+    m = re.search(r"\b(2\d{9,12})\b", text.strip())
+    if m:
+        return m.group(1)
+    m2 = re.search(r"(\d{10,13})", text.strip())
+    if m2:
+        return m2.group(1)
+    return ""
+
 def calculate_next_wednesday_deadline() -> tuple:
     """
     推算下周三 18:00。
@@ -288,9 +298,43 @@ class HomeworkPlugin(Star):
             ))
             return
 
-        # 2. 私聊防滥用与防刷保护（管理员豁免）
+        # 2. 私聊防滥用、首次身份握手与防刷保护（管理员豁免）
         if event.is_private_chat() and not is_admin(event):
             msg_text = event.get_message_str().strip()
+            sender_id = str(event.get_sender_id())
+
+            # 检查是否已建立身份连接（绑定学号）
+            try:
+                bind_data = await async_api_get(f"/api/bindings/{sender_id}")
+            except Exception:
+                bind_data = {}
+
+            if bind_data.get("error"):
+                # 如果输入中直接包含 10~13 位学号，尝试自动绑定
+                sid = extract_student_id(msg_text)
+                if sid:
+                    try:
+                        auto_bind = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
+                        if auto_bind.get("success"):
+                            bind_data = auto_bind.get("binding", {})
+                    except Exception:
+                        pass
+
+            if bind_data.get("error") and not msg_text.startswith("/") and not msg_text.startswith("!"):
+                # 仍未绑定，拦截本次大模型请求并友好引导建立连接
+                event.stop_event()
+                session_key = (sender_id, "")
+                PENDING_SESSIONS[session_key] = {
+                    "time": time.time(),
+                    "type": "bind_and_chat",
+                    "question": msg_text,
+                }
+                await event.send(event.plain_result(
+                    "👋 同学你好！欢迎咨询《并行计算》课程助教助手。\n"
+                    "为了记录答疑与同步作业，首次交流请直接回复你的【学号】（例如：240809010501）：\n"
+                    "自动核对花名册后将为你建立连接并开启答疑服务！"
+                ))
+                return
             
             # 单次提问字数上限保护
             if len(msg_text) > MAX_PROMPT_CHARS:
@@ -958,13 +1002,23 @@ class HomeworkPlugin(Star):
                 return
 
             if bind_data.get("error"):
+                yield event.plain_result(f"⏳ 正在接收并暂存你的作业文件【{raw_filename}】...")
+                local_path = await file_comp.get_file()
+                if not local_path or not os.path.exists(local_path):
+                    yield event.plain_result("❌ 接收文件失败，请重新发送。")
+                    return
+
+                PENDING_SESSIONS[session_key] = {
+                    "time": time.time(),
+                    "type": "bind_and_submit",
+                    "file_path": local_path,
+                    "filename": raw_filename,
+                }
                 yield event.plain_result(
-                    f"👋 同学你好！检测到你正在私聊提交作业文件【{raw_filename}】。\n"
-                    "但你当前尚未绑定学号身份，系统无法为你自动匹配归档信息。\n\n"
-                    "👉 请直接回复以下指令完成快速绑定：\n"
-                    "   /绑定 学号 姓名\n"
-                    "   例如：/绑定 240809010501 支全振\n\n"
-                    "绑定完成后再次发送该文件即可自动秒级入库归档！"
+                    f"👋 同学你好！已成功接收你的作业文件【{raw_filename}】。\n"
+                    "由于你是首次使用，请直接回复你的【学号】（例如：240809010501）：\n"
+                    "自动核对花名册后将为你建立连接，并直接归档刚才发送的作业！\n"
+                    "（回复 取消 可放弃本次提交，120 秒内有效）"
                 )
                 return
 
@@ -1045,6 +1099,12 @@ class HomeworkPlugin(Star):
 
         # 取消会话
         if text.lower() in ["取消", "退出", "q", "quit", "cancel"]:
+            fpath = session_info.get("file_path")
+            if fpath and os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
             del PENDING_SESSIONS[session_key]
             yield event.plain_result("❎ 已取消本次操作。")
             event.stop_event()
@@ -1121,7 +1181,123 @@ class HomeworkPlugin(Star):
                 )
                 return
 
-        # 3.2 导出 / 查作业 / 未交 多轮选择
+        # 3.2 首次发文件后回复学号绑定并自动归档作业
+        if s_type == "bind_and_submit":
+            sid = extract_student_id(text)
+            if not sid:
+                yield event.plain_result("⚠️ 未识别到有效学号。请直接回复 12 位学号（例如：240809010501），回复 取消 可退出本次提交。")
+                event.stop_event()
+                return
+
+            del PENDING_SESSIONS[session_key]
+            event.stop_event()
+
+            yield event.plain_result(f"⏳ 正在核对学号【{sid}】并自动绑定归档作业...")
+
+            # 1. 尝试绑定
+            bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
+            if not bind_res.get("success"):
+                err = bind_res.get("error", "学号核验失败")
+                yield event.plain_result(f"❌ 绑定失败：{err}\n请核对学号后重新发送作业文件。")
+                fpath = session_info.get("file_path")
+                if fpath and os.path.exists(fpath):
+                    try:
+                        os.remove(fpath)
+                    except Exception:
+                        pass
+                return
+
+            b = bind_res.get("binding", {})
+            st_name = b.get("student_name", "")
+            cl_name = b.get("class_name", "")
+            fpath = session_info.get("file_path")
+            fname = session_info.get("filename")
+
+            # 2. 提交暂存的作业文件
+            try:
+                upload_res = await async_upload_file(
+                    assignment_id="latest",
+                    file_path=fpath,
+                    orig_filename=fname,
+                    student_id=sid,
+                    student_name=st_name,
+                    class_name=cl_name,
+                    qq_id=sender_id,
+                )
+            finally:
+                if fpath and os.path.exists(fpath):
+                    try:
+                        os.remove(fpath)
+                    except Exception:
+                        pass
+
+            if not upload_res.get("success"):
+                yield event.plain_result(
+                    f"✅ 身份连接成功：{st_name}（{cl_name}）！\n"
+                    f"⚠️ 但作业归档失败：{upload_res.get('error', '未知错误')}\n"
+                    "现在你的身份已绑定完成，请直接重新发送一次作业压缩包即可！"
+                )
+                return
+
+            size_str = format_file_size(upload_res.get("file_size", 0))
+            sub_time = upload_res.get("submitted_at", "")[:19].replace("T", " ")
+            sha_short = upload_res.get("sha256", "")[:16]
+            ver = upload_res.get("version", 1)
+            is_update = upload_res.get("is_update", False)
+            is_late = upload_res.get("is_late", False)
+            update_str = " (覆盖更新)" if is_update else ""
+            late_str = " ⚠️【迟交】" if is_late else ""
+
+            combined_card = (
+                f"🎉【身份连接与作业归档均已成功】\n"
+                "━━━━━━━━━━━━━━━\n"
+                f"👤 验证学生：{st_name}（{sid}）\n"
+                f"🏫 归属班级：{cl_name}\n"
+                f"📱 绑定账号：QQ {sender_id}\n"
+                "━━━━━━━━━━━━━━━\n"
+                f"📁 归档文件：{upload_res.get('target_filename')}\n"
+                f"📦 文件大小：{size_str}\n"
+                f"🔒 SHA256：{sha_short}...\n"
+                f"🕒 提交时间：{sub_time}\n"
+                f"📌 提交状态：第 {ver} 次提交{update_str}{late_str}\n"
+                "━━━━━━━━━━━━━━━\n"
+                "✅ 一切已全自动搞定！以后修改作业直接私聊把新压缩包发给我就行，无需再输入任何信息。"
+            )
+            yield event.plain_result(combined_card)
+            return
+
+        # 3.3 首次提问被拦截后回复学号建立连接
+        if s_type == "bind_and_chat":
+            sid = extract_student_id(text)
+            if not sid:
+                yield event.plain_result("⚠️ 未识别到有效学号。请直接回复 12 位学号（例如：240809010501），回复 取消 退出。")
+                event.stop_event()
+                return
+
+            del PENDING_SESSIONS[session_key]
+            event.stop_event()
+
+            bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
+            if not bind_res.get("success"):
+                err = bind_res.get("error", "学号核验失败")
+                yield event.plain_result(f"❌ 绑定失败：{err}\n请核对学号后重新发送。")
+                return
+
+            b = bind_res.get("binding", {})
+            st_name = b.get("student_name", "")
+            cl_name = b.get("class_name", "")
+
+            yield event.plain_result(
+                f"🎉 身份建立成功！欢迎【{st_name}】同学（{cl_name}）。\n"
+                "━━━━━━━━━━━━━━━\n"
+                "助教已为你就绪，现在你可以：\n"
+                "1️⃣ 随时向我提问课程概念、C/C++ 代码或并行计算报错\n"
+                "2️⃣ 直接私聊发送作业压缩包秒级提交入库\n"
+                "3️⃣ 发送 /查作业 查看当前提交状态"
+            )
+            return
+
+        # 3.4 导出 / 查作业 / 未交 多轮选择
         options = session_info.get("options", {})
         if text in options:
             del PENDING_SESSIONS[session_key]
@@ -1153,3 +1329,36 @@ class HomeworkPlugin(Star):
             yield event.plain_result(f"⚠️ 未找到序号 [{text}] 对应的作业选项，请回复有效序号，或回复 取消 退出。")
             event.stop_event()
             return
+
+        # 4. 私聊直接发送纯学号快速建立连接
+        if is_private and not text.startswith("/") and not text.startswith("!"):
+            sid = extract_student_id(text)
+            clean_text = text.replace(" ", "").replace("学号", "").replace("：", "").replace(":", "")
+            if sid and len(clean_text) <= 16:
+                try:
+                    check_b = await async_api_get(f"/api/bindings/{sender_id}")
+                except Exception:
+                    check_b = {}
+
+                if check_b.get("error"):
+                    event.stop_event()
+                    yield event.plain_result(f"⏳ 正在核对学号【{sid}】...")
+                    bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
+                    if bind_res.get("success"):
+                        b = bind_res.get("binding", {})
+                        yield event.plain_result(
+                            f"🎉【身份连接建立成功】\n"
+                            "━━━━━━━━━━━━━━━\n"
+                            f"👤 验证学生：{b.get('student_name')}\n"
+                            f"🆔 学号：{sid}\n"
+                            f"🏫 班级：{b.get('class_name')}\n"
+                            "━━━━━━━━━━━━━━━\n"
+                            "💡 欢迎使用并行计算课程助手！现在你可以直接：\n"
+                            "1️⃣ 私聊发送作业压缩包 —— 自动秒级归档\n"
+                            "2️⃣ 私聊提问代码报错或学术疑问\n"
+                            "3️⃣ 发送 /查作业 查看提交进度"
+                        )
+                        return
+                    else:
+                        yield event.plain_result(f"⚠️ 绑定失败：{bind_res.get('error')}")
+                        return

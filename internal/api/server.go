@@ -780,6 +780,18 @@ func (s *Server) handleCreateBinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Anti-impersonation check: ensure student_id is not already bound by another QQ
+	if existing, err := s.database.GetStudentBindingByStudentID(req.StudentID); err == nil && existing != nil {
+		if existing.QQID != req.QQID {
+			masked := existing.QQID
+			if len(masked) > 4 {
+				masked = masked[:2] + "****" + masked[len(masked)-2:]
+			}
+			writeJSONError(w, http.StatusConflict, fmt.Sprintf("该学号已被 QQ (%s) 绑定。若为你本人账号，请联系助教人工处理", masked))
+			return
+		}
+	}
+
 	binding := &db.StudentBinding{
 		QQID:        req.QQID,
 		StudentID:   req.StudentID,
