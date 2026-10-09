@@ -52,6 +52,15 @@ type Submission struct {
 	StoragePath string `json:"storage_path,omitempty"`
 }
 
+type StudentBinding struct {
+	QQID        string    `json:"qq_id"`
+	StudentID   string    `json:"student_id"`
+	StudentName string    `json:"student_name"`
+	ClassName   string    `json:"class_name"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 // [Filter]
 type AttachmentFilter struct {
 	Keyword  string
@@ -138,6 +147,15 @@ func (d *DB) migrate() error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_submissions_lookup ON submissions(assignment_id, student_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_submissions_latest ON submissions(assignment_id, is_latest);`,
+		`CREATE TABLE IF NOT EXISTS student_bindings (
+			qq_id TEXT PRIMARY KEY,
+			student_id TEXT NOT NULL,
+			student_name TEXT NOT NULL,
+			class_name TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_student_bindings_student_id ON student_bindings(student_id);`,
 	}
 
 	for _, q := range queries {
@@ -596,3 +614,130 @@ func (d *DB) GetAllLatestSubmissionsForStudent(studentID string) ([]*Submission,
 	}
 	return list, nil
 }
+
+// [StudentBindings]
+func (d *DB) UpsertStudentBinding(b *StudentBinding) error {
+	query := `INSERT INTO student_bindings (
+		qq_id, student_id, student_name, class_name, created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?)
+	ON CONFLICT(qq_id) DO UPDATE SET
+		student_id = excluded.student_id,
+		student_name = excluded.student_name,
+		class_name = excluded.class_name,
+		updated_at = excluded.updated_at`
+
+	now := time.Now().UTC()
+	if b.CreatedAt.IsZero() {
+		b.CreatedAt = now
+	}
+	b.UpdatedAt = now
+
+	_, err := d.conn.Exec(
+		query,
+		b.QQID,
+		b.StudentID,
+		b.StudentName,
+		b.ClassName,
+		b.CreatedAt.UTC().Format(time.RFC3339),
+		b.UpdatedAt.UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		return fmt.Errorf("db: upsert student binding: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) GetStudentBindingByQQ(qqID string) (*StudentBinding, error) {
+	query := `SELECT qq_id, student_id, student_name, class_name, created_at, updated_at
+		FROM student_bindings WHERE qq_id = ?`
+
+	var b StudentBinding
+	var crStr, upStr string
+	err := d.conn.QueryRow(query, qqID).Scan(
+		&b.QQID,
+		&b.StudentID,
+		&b.StudentName,
+		&b.ClassName,
+		&crStr,
+		&upStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("db: get binding by qq: %w", err)
+	}
+	b.CreatedAt, _ = time.Parse(time.RFC3339, crStr)
+	b.UpdatedAt, _ = time.Parse(time.RFC3339, upStr)
+	return &b, nil
+}
+
+func (d *DB) GetStudentBindingByStudentID(studentID string) (*StudentBinding, error) {
+	query := `SELECT qq_id, student_id, student_name, class_name, created_at, updated_at
+		FROM student_bindings WHERE student_id = ? LIMIT 1`
+
+	var b StudentBinding
+	var crStr, upStr string
+	err := d.conn.QueryRow(query, studentID).Scan(
+		&b.QQID,
+		&b.StudentID,
+		&b.StudentName,
+		&b.ClassName,
+		&crStr,
+		&upStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("db: get binding by student id: %w", err)
+	}
+	b.CreatedAt, _ = time.Parse(time.RFC3339, crStr)
+	b.UpdatedAt, _ = time.Parse(time.RFC3339, upStr)
+	return &b, nil
+}
+
+func (d *DB) DeleteStudentBinding(qqID string) error {
+	query := `DELETE FROM student_bindings WHERE qq_id = ?`
+	res, err := d.conn.Exec(query, qqID)
+	if err != nil {
+		return fmt.Errorf("db: delete student binding: %w", err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (d *DB) ListStudentBindings() ([]*StudentBinding, error) {
+	query := `SELECT qq_id, student_id, student_name, class_name, created_at, updated_at
+		FROM student_bindings ORDER BY student_id ASC`
+
+	rows, err := d.conn.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("db: list student bindings: %w", err)
+	}
+	defer rows.Close()
+
+	var list []*StudentBinding
+	for rows.Next() {
+		var b StudentBinding
+		var crStr, upStr string
+		if err := rows.Scan(
+			&b.QQID,
+			&b.StudentID,
+			&b.StudentName,
+			&b.ClassName,
+			&crStr,
+			&upStr,
+		); err != nil {
+			return nil, fmt.Errorf("db: scan student binding: %w", err)
+		}
+		b.CreatedAt, _ = time.Parse(time.RFC3339, crStr)
+		b.UpdatedAt, _ = time.Parse(time.RFC3339, upStr)
+		list = append(list, &b)
+	}
+	return list, nil
+}
+

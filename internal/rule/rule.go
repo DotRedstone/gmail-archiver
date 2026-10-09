@@ -171,6 +171,49 @@ func (e *Engine) GetRule(id string) (*AssignmentRule, bool) {
 	return nil, false
 }
 
+func (e *Engine) LatestRule() *AssignmentRule {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if len(e.rules) == 0 {
+		return nil
+	}
+
+	now := time.Now().UTC()
+	var unexpired []*AssignmentRule
+	for _, r := range e.rules {
+		if r.Deadline.IsZero() || r.Deadline.After(now) {
+			unexpired = append(unexpired, r)
+		}
+	}
+
+	if len(unexpired) > 0 {
+		return unexpired[len(unexpired)-1]
+	}
+
+	return e.rules[len(e.rules)-1]
+}
+
+func (e *Engine) SaveAndLoadRule(cfg RuleFileConfig, rulesDir string) (*AssignmentRule, error) {
+	if cfg.ID == "" {
+		return nil, fmt.Errorf("rule id is required")
+	}
+	if err := os.MkdirAll(rulesDir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir rules dir: %w", err)
+	}
+
+	filePath := filepath.Join(rulesDir, cfg.ID+".yaml")
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("marshal rule yaml: %w", err)
+	}
+
+	if err := os.WriteFile(filePath, data, 0o644); err != nil {
+		return nil, fmt.Errorf("write rule file: %w", err)
+	}
+
+	return e.LoadRuleFile(filePath)
+}
+
 // [Match]
 func (e *Engine) Match(subject, filename, bodyText string, receivedAt time.Time) (*AssignmentRule, *MatchResult, bool) {
 	e.mu.RLock()
@@ -290,6 +333,62 @@ func (r *AssignmentRule) Match(subject, filename, bodyText string, receivedAt ti
 		MatchedBy:      matchedBy,
 	}, true
 }
+
+func (r *AssignmentRule) NormalizeSubmission(studentID, studentName, className, originalFilename string, submittedAt time.Time) (finalID, finalName, finalClass, targetFilename string, isLate bool, err error) {
+	var student *roster.Student
+	if studentID != "" {
+		if s, ok := r.Roster.FindByID(studentID); ok {
+			student = &s
+		}
+	}
+	if student == nil && studentName != "" {
+		list := r.Roster.FindByName(studentName)
+		if len(list) == 1 {
+			student = &list[0]
+		}
+	}
+
+	if student != nil {
+		finalID = student.StudentID
+		finalName = student.Name
+		finalClass = student.ClassName
+		if className != "" {
+			finalClass = className
+		}
+	} else {
+		finalID = strings.TrimSpace(studentID)
+		finalName = strings.TrimSpace(studentName)
+		finalClass = strings.TrimSpace(className)
+		if finalID == "" && finalName == "" {
+			return "", "", "", "", false, fmt.Errorf("student identification (id or name) required")
+		}
+	}
+
+	ext := "zip"
+	origLower := strings.ToLower(originalFilename)
+	if strings.HasSuffix(origLower, ".tar.gz") {
+		ext = "tar.gz"
+	} else if dotExt := filepath.Ext(originalFilename); dotExt != "" {
+		ext = strings.TrimPrefix(dotExt, ".")
+	}
+
+	targetName := originalFilename
+	if r.TargetFilename != "" {
+		tn := r.TargetFilename
+		tn = strings.ReplaceAll(tn, "{class}", finalClass)
+		tn = strings.ReplaceAll(tn, "{student_id}", finalID)
+		tn = strings.ReplaceAll(tn, "{name}", finalName)
+		tn = strings.ReplaceAll(tn, "{ext}", ext)
+		targetName = tn
+	}
+
+	if !r.Deadline.IsZero() && submittedAt.After(r.Deadline) {
+		isLate = true
+	}
+
+	return finalID, finalName, finalClass, targetName, isLate, nil
+}
+
 
 func extractNamedGroups(re *regexp.Regexp, s string) map[string]string {
 	match := re.FindStringSubmatch(s)

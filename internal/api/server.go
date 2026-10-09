@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -69,8 +70,16 @@ func (s *Server) Routes() http.Handler {
 			att.Get("/{id}/download", s.handleDownloadAttachment)
 		})
 
+		api.Route("/api/bindings", func(b chi.Router) {
+			b.Get("/", s.handleListBindings)
+			b.Get("/{qq_id}", s.handleGetBinding)
+			b.Post("/", s.handleCreateBinding)
+			b.Delete("/{qq_id}", s.handleDeleteBinding)
+		})
+
 		api.Route("/api/assignments", func(as chi.Router) {
 			as.Get("/", s.handleListAssignments)
+			as.Post("/", s.handleCreateAssignment)
 			as.Get("/export/all", s.handleSemesterExportZip)
 			as.Get("/{id}/status", s.handleAssignmentStatus)
 			as.Get("/{id}/missing", s.handleAssignmentMissing)
@@ -78,6 +87,7 @@ func (s *Server) Routes() http.Handler {
 			as.Get("/{id}/submissions/{student_id}/download", s.handleStudentSubmissionDownload)
 			as.Get("/{id}/submissions/{student_id}/history", s.handleStudentSubmissionHistory)
 			as.Get("/{id}/export", s.handleAssignmentExportZip)
+			as.Post("/{id}/upload", s.handleAssignmentUpload)
 		})
 
 		api.Route("/api/students", func(st chi.Router) {
@@ -688,3 +698,282 @@ func (s *Server) handleStudentAllAssignmentsExportZip(w http.ResponseWriter, r *
 		file.Close()
 	}
 }
+
+// [StudentBindingsHandlers]
+func (s *Server) handleListBindings(w http.ResponseWriter, r *http.Request) {
+	list, err := s.database.ListStudentBindings()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to list bindings: "+err.Error())
+		return
+	}
+	if list == nil {
+		list = []*db.StudentBinding{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"bindings": list,
+		"total":    len(list),
+	})
+}
+
+func (s *Server) handleGetBinding(w http.ResponseWriter, r *http.Request) {
+	qqID := chi.URLParam(r, "qq_id")
+	b, err := s.database.GetStudentBindingByQQ(qqID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeJSONError(w, http.StatusNotFound, "binding not found")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "failed to get binding: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, b)
+}
+
+type createBindingRequest struct {
+	QQID        string `json:"qq_id"`
+	StudentID   string `json:"student_id"`
+	StudentName string `json:"student_name"`
+	ClassName   string `json:"class_name"`
+}
+
+func (s *Server) handleCreateBinding(w http.ResponseWriter, r *http.Request) {
+	var req createBindingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	req.QQID = strings.TrimSpace(req.QQID)
+	req.StudentID = strings.TrimSpace(req.StudentID)
+	req.StudentName = strings.TrimSpace(req.StudentName)
+	req.ClassName = strings.TrimSpace(req.ClassName)
+
+	if req.QQID == "" || req.StudentID == "" {
+		writeJSONError(w, http.StatusBadRequest, "qq_id and student_id are required")
+		return
+	}
+
+	// Cross-check with roster from all loaded assignment rules
+	var foundName, foundClass string
+	var rosterFound bool
+
+	for _, rule := range s.rules.Rules() {
+		if student, ok := rule.Roster.FindByID(req.StudentID); ok {
+			foundName = student.Name
+			foundClass = student.ClassName
+			rosterFound = true
+			break
+		}
+	}
+
+	if rosterFound {
+		if req.StudentName != "" && req.StudentName != foundName {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("学号 %s 与姓名 %q 不匹配（花名册中应为 %s）", req.StudentID, req.StudentName, foundName))
+			return
+		}
+		req.StudentName = foundName
+		if req.ClassName == "" {
+			req.ClassName = foundClass
+		}
+	} else if req.StudentName == "" {
+		writeJSONError(w, http.StatusBadRequest, "花名册中未检索到该学号，请同时提供姓名")
+		return
+	}
+
+	binding := &db.StudentBinding{
+		QQID:        req.QQID,
+		StudentID:   req.StudentID,
+		StudentName: req.StudentName,
+		ClassName:   req.ClassName,
+	}
+
+	if err := s.database.UpsertStudentBinding(binding); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to save binding: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"binding": binding,
+	})
+}
+
+func (s *Server) handleDeleteBinding(w http.ResponseWriter, r *http.Request) {
+	qqID := chi.URLParam(r, "qq_id")
+	if err := s.database.DeleteStudentBinding(qqID); err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeJSONError(w, http.StatusNotFound, "binding not found")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "failed to delete binding: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+}
+
+// [AssignmentUploadHandler]
+func (s *Server) handleAssignmentUpload(w http.ResponseWriter, r *http.Request) {
+	// Limit request body to 100MB
+	r.Body = http.MaxBytesReader(w, r.Body, 100<<20)
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "failed to parse multipart form (max 100MB): "+err.Error())
+		return
+	}
+
+	assignmentID := chi.URLParam(r, "id")
+	var targetRule *rule.AssignmentRule
+	if assignmentID == "latest" || assignmentID == "current" || assignmentID == "" {
+		targetRule = s.rules.LatestRule()
+	} else {
+		targetRule, _ = s.rules.GetRule(assignmentID)
+	}
+
+	if targetRule == nil {
+		writeJSONError(w, http.StatusNotFound, "assignment not found or no active assignments")
+		return
+	}
+
+	studentID := strings.TrimSpace(r.FormValue("student_id"))
+	studentName := strings.TrimSpace(r.FormValue("student_name"))
+	className := strings.TrimSpace(r.FormValue("class_name"))
+	qqID := strings.TrimSpace(r.FormValue("qq_id"))
+	uploader := strings.TrimSpace(r.FormValue("uploader"))
+
+	if uploader == "" && qqID != "" {
+		uploader = "qq:" + qqID
+	}
+
+	// Auto fill from binding if qq_id is provided and student_id is omitted
+	if studentID == "" && qqID != "" {
+		if b, err := s.database.GetStudentBindingByQQ(qqID); err == nil {
+			studentID = b.StudentID
+			if studentName == "" {
+				studentName = b.StudentName
+			}
+			if className == "" {
+				className = b.ClassName
+			}
+		}
+	}
+
+	if studentID == "" && studentName == "" {
+		writeJSONError(w, http.StatusBadRequest, "student_id or bound qq_id is required")
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "missing or invalid file field in form")
+		return
+	}
+	defer file.Close()
+
+	now := time.Now().UTC()
+	relPath, hashHex, fileSize, err := s.storage.Save(file, header.Filename, now)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to save file: "+err.Error())
+		return
+	}
+
+	// Normalize student identity and formatted target filename
+	finalID, finalName, finalClass, targetFilename, isLate, normErr := targetRule.NormalizeSubmission(
+		studentID, studentName, className, header.Filename, now,
+	)
+	if normErr != nil {
+		writeJSONError(w, http.StatusBadRequest, "student validation error: "+normErr.Error())
+		return
+	}
+
+	// Record attachment
+	att := &db.Attachment{
+		MessageID:   fmt.Sprintf("direct-upload-%d-%s", now.UnixNano(), hashHex[:8]),
+		Sender:      uploader,
+		Subject:     targetRule.Name,
+		ReceivedAt:  now,
+		Filename:    header.Filename,
+		FileSize:    fileSize,
+		SHA256:      hashHex,
+		MIMEType:    header.Header.Get("Content-Type"),
+		StoragePath: relPath,
+	}
+
+	attID, err := s.database.InsertAttachment(att)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to record attachment: "+err.Error())
+		return
+	}
+
+	sub := &db.Submission{
+		AssignmentID:   targetRule.ID,
+		StudentID:      finalID,
+		StudentName:    finalName,
+		ClassName:      finalClass,
+		AttachmentID:   attID,
+		SubmittedAt:    now,
+		IsLate:         isLate,
+		TargetFilename: targetFilename,
+	}
+
+	version, isUpdate, err := s.database.RecordSubmission(sub)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to record submission: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":         true,
+		"assignment_id":   targetRule.ID,
+		"assignment_name": targetRule.Name,
+		"student_id":      finalID,
+		"student_name":    finalName,
+		"class_name":      finalClass,
+		"target_filename": targetFilename,
+		"version":         version,
+		"is_update":       isUpdate,
+		"is_late":         isLate,
+		"file_size":       fileSize,
+		"sha256":          hashHex,
+		"submitted_at":    now.Format(time.RFC3339),
+	})
+}
+
+// [CreateAssignmentHandler]
+func (s *Server) handleCreateAssignment(w http.ResponseWriter, r *http.Request) {
+	var raw rule.RuleFileConfig
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	if raw.ID == "" || raw.Name == "" {
+		writeJSONError(w, http.StatusBadRequest, "id and name are required")
+		return
+	}
+
+	if len(raw.Rosters) == 0 {
+		raw.Rosters = []string{"rosters/2024_cs_5.csv", "rosters/2024_green_compute_1.csv"}
+	}
+	if raw.TargetFilename == "" {
+		raw.TargetFilename = "作业-{class}-{student_id}-{name}.{ext}"
+	}
+
+	rulesDir := s.cfg.RulesDir
+	if rulesDir == "" {
+		rulesDir = filepath.Join(s.cfg.DataDir, "rules")
+	}
+
+	createdRule, err := s.rules.SaveAndLoadRule(raw, rulesDir)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to save and load rule: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":      true,
+		"id":           createdRule.ID,
+		"name":         createdRule.Name,
+		"deadline":     createdRule.Deadline.Format(time.RFC3339),
+		"roster_count": createdRule.Roster.Count(),
+	})
+}
+

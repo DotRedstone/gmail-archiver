@@ -219,3 +219,78 @@ func TestSubmissionVersioningAndOverwrite(t *testing.T) {
 		t.Errorf("history[1] should be v1 non-latest, got %+v", history[1])
 	}
 }
+
+func TestStudentBindings(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "db_binding_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	database, err := Open(tmpDir)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer database.Close()
+
+	// 1. Initial lookup not found
+	_, err = database.GetStudentBindingByQQ("123456789")
+	if err != ErrNotFound {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+
+	// 2. Insert binding
+	b := &StudentBinding{
+		QQID:        "123456789",
+		StudentID:   "240809010501",
+		StudentName: "支全振",
+		ClassName:   "2024级计算机科学与技术5班",
+	}
+	if err := database.UpsertStudentBinding(b); err != nil {
+		t.Fatalf("UpsertStudentBinding: %v", err)
+	}
+
+	// 3. Query by QQ and Student ID
+	got, err := database.GetStudentBindingByQQ("123456789")
+	if err != nil {
+		t.Fatalf("GetStudentBindingByQQ: %v", err)
+	}
+	if got.StudentID != "240809010501" || got.StudentName != "支全振" {
+		t.Errorf("unexpected binding: %+v", got)
+	}
+
+	gotByID, err := database.GetStudentBindingByStudentID("240809010501")
+	if err != nil {
+		t.Fatalf("GetStudentBindingByStudentID: %v", err)
+	}
+	if gotByID.QQID != "123456789" {
+		t.Errorf("unexpected binding by student id: %+v", gotByID)
+	}
+
+	// 4. Update binding (Upsert on same QQ)
+	b.StudentID = "240809010502"
+	b.StudentName = "王五"
+	if err := database.UpsertStudentBinding(b); err != nil {
+		t.Fatalf("UpsertStudentBinding update: %v", err)
+	}
+	gotUpdated, err := database.GetStudentBindingByQQ("123456789")
+	if err != nil || gotUpdated.StudentID != "240809010502" {
+		t.Errorf("expected updated student_id, got %+v", gotUpdated)
+	}
+
+	// 5. List bindings
+	list, err := database.ListStudentBindings()
+	if err != nil || len(list) != 1 {
+		t.Fatalf("expected 1 binding in list, got len=%d, err=%v", len(list), err)
+	}
+
+	// 6. Delete binding
+	if err := database.DeleteStudentBinding("123456789"); err != nil {
+		t.Fatalf("DeleteStudentBinding: %v", err)
+	}
+	_, err = database.GetStudentBindingByQQ("123456789")
+	if err != ErrNotFound {
+		t.Errorf("expected ErrNotFound after delete, got %v", err)
+	}
+}
+

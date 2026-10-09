@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -326,4 +327,58 @@ target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
 	if recInvalidToken.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for wrong token, got %d", recInvalidToken.Code)
 	}
+
+	// 16. Test Student Binding API
+	// 16.1 Create binding with roster match
+	bindBody := []byte(`{"qq_id":"1689491386","student_id":"240809010501","student_name":"支全振"}`)
+	reqBind := httptest.NewRequest("POST", "/api/bindings?token=secret-token-123", bytes.NewReader(bindBody))
+	reqBind.Header.Set("Content-Type", "application/json")
+	recBind := httptest.NewRecorder()
+	handler.ServeHTTP(recBind, reqBind)
+	if recBind.Code != http.StatusOK {
+		t.Fatalf("expected 200 for binding, got %d: %s", recBind.Code, recBind.Body.String())
+	}
+
+	// 16.2 Get binding
+	reqGetBind := httptest.NewRequest("GET", "/api/bindings/1689491386?token=secret-token-123", nil)
+	recGetBind := httptest.NewRecorder()
+	handler.ServeHTTP(recGetBind, reqGetBind)
+	if recGetBind.Code != http.StatusOK {
+		t.Fatalf("expected 200 for get binding, got %d: %s", recGetBind.Code, recGetBind.Body.String())
+	}
+	var bindResp db.StudentBinding
+	_ = json.Unmarshal(recGetBind.Body.Bytes(), &bindResp)
+	if bindResp.StudentID != "240809010501" || bindResp.StudentName != "支全振" || bindResp.ClassName != "2024级计算机科学与技术5班" {
+		t.Errorf("unexpected binding response: %+v", bindResp)
+	}
+
+	// 17. Test Direct Upload API (Direct upload assignment submission)
+	bodyBuf := &bytes.Buffer{}
+	mpWriter := multipart.NewWriter(bodyBuf)
+	_ = mpWriter.WriteField("qq_id", "1689491386") // Should auto fill student_id 240809010501
+	fileWriter, _ := mpWriter.CreateFormFile("file", "my_code_submission.zip")
+	_, _ = fileWriter.Write([]byte("fake zip archive content"))
+	_ = mpWriter.Close()
+
+	reqUpload := httptest.NewRequest("POST", "/api/assignments/latest/upload?token=secret-token-123", bodyBuf)
+	reqUpload.Header.Set("Content-Type", mpWriter.FormDataContentType())
+	recUpload := httptest.NewRecorder()
+	handler.ServeHTTP(recUpload, reqUpload)
+	if recUpload.Code != http.StatusOK {
+		t.Fatalf("expected 200 for upload, got %d: %s", recUpload.Code, recUpload.Body.String())
+	}
+
+	var uploadResp map[string]any
+	_ = json.Unmarshal(recUpload.Body.Bytes(), &uploadResp)
+	if uploadResp["success"] != true {
+		t.Fatalf("upload failed: %+v", uploadResp)
+	}
+	if uploadResp["student_id"] != "240809010501" {
+		t.Errorf("expected student_id 240809010501, got %v", uploadResp["student_id"])
+	}
+	expectedFilename := "实验1-2024级计算机科学与技术5班-240809010501-支全振.zip"
+	if uploadResp["target_filename"] != expectedFilename {
+		t.Errorf("expected target_filename %s, got %v", expectedFilename, uploadResp["target_filename"])
+	}
 }
+

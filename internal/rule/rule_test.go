@@ -78,4 +78,25 @@ target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
 	if !ok || !lateRes.IsLate {
 		t.Errorf("expected late match, got ok=%v, isLate=%v", ok, lateRes.IsLate)
 	}
+
+	// 3. NormalizeSubmission directly (for QQ / Web upload)
+	finalID, finalName, finalClass, targetName, isLate, normErr := rule.NormalizeSubmission(
+		"240809010501", "", "", "any_random_name.zip", recvAt,
+	)
+	if normErr != nil {
+		t.Fatalf("NormalizeSubmission: %v", normErr)
+	}
+	if finalID != "240809010501" || finalName != "支全振" || finalClass != "2024级计算机科学与技术5班" {
+		t.Errorf("expected auto roster lookup, got %s, %s, %s", finalID, finalName, finalClass)
+	}
+	if targetName != "实验1-2024级计算机科学与技术5班-240809010501-支全振.zip" || isLate {
+		t.Errorf("unexpected targetName=%s, isLate=%v", targetName, isLate)
+	}
+
+	// 4. Test LatestRule
+	latest := engine.LatestRule()
+	if latest == nil || latest.ID != "parallel_computing_lab1" {
+		t.Errorf("expected latest rule parallel_computing_lab1, got %+v", latest)
+	}
 }
+
