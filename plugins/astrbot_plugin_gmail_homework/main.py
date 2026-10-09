@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
@@ -218,12 +218,33 @@ def format_class_name(raw: str, student_id: str = "") -> str:
         return "24绿算"
     return clean or "245班"
 
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+def format_beijing_time(raw_time: str, with_seconds: bool = False) -> str:
+    """
+    统一将 UTC 时间或带时区时间格式化为中国北京时间（UTC+8）。
+    兼容 '2026-10-09T11:05:25Z'、'+08:00' 等 ISO 8601 标准格式。
+    """
+    if not raw_time:
+        return ""
+    raw = str(raw_time).strip()
+    try:
+        clean = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        bj_dt = dt.astimezone(BEIJING_TZ)
+        fmt = "%Y-%m-%d %H:%M:%S" if with_seconds else "%Y-%m-%d %H:%M"
+        return bj_dt.strftime(fmt)
+    except Exception:
+        return raw[:19 if with_seconds else 16].replace("T", " ")
+
 def calculate_next_wednesday_deadline() -> tuple:
     """
-    推算下周三 18:00。
+    推算下周三 18:00（基于北京时间）。
     返回值: (friendly_str, iso_str)
     """
-    now = datetime.now()
+    now = datetime.now(BEIJING_TZ)
     # weekday(): Monday is 0, Sunday is 6, Wednesday is 2.
     days_ahead = (2 - now.weekday()) % 7
     if days_ahead == 0:
@@ -259,7 +280,7 @@ def generate_notice_text(lab_num: str, deadline_friendly: str) -> str:
 
 def render_status_card(data: dict) -> str:
     """生成单次作业统计详情卡片（规范学术语言）"""
-    deadline = data.get("deadline", "")[:16].replace("T", " ")
+    deadline = format_beijing_time(data.get("deadline", ""))
     return (
         f"📊【{data['assignment_name']}】作业提交统计\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -327,7 +348,7 @@ async def build_student_status_card(student_id: str, student_name: str, class_na
     for a in assignments:
         aid = a["id"]
         a_name = a["name"]
-        dl = a.get("deadline", "")[:16].replace("T", " ")
+        dl = format_beijing_time(a.get("deadline", ""))
         try:
             sub_data = await async_api_get(f"/api/assignments/{aid}/submissions")
             matched_subs = [
@@ -340,7 +361,7 @@ async def build_student_status_card(student_id: str, student_name: str, class_na
         if matched_subs:
             s = matched_subs[0]
             size_str = format_file_size(s.get("file_size", 0))
-            sub_time = s.get("submitted_at", "")[:16].replace("T", " ")
+            sub_time = format_beijing_time(s.get("submitted_at", ""))
             late_tag = " ⚠️【迟交】" if s.get("is_late") else ""
             results.append(
                 f"🔹【{a_name}】：\n"
@@ -574,7 +595,7 @@ class HomeworkPlugin(Star):
             if subs:
                 s = subs[0]
                 size_str = format_file_size(s.get("file_size", 0))
-                time_str = s.get("submitted_at", "")[:16].replace("T", " ")
+                time_str = format_beijing_time(s.get("submitted_at", ""))
                 late = " (迟交)" if s.get("is_late") else ""
                 results.append(f"{a_name}: 已提交归档{late}，附件名 {s.get('target_filename')}，大小 {size_str}，时间 {time_str}")
             else:
@@ -587,7 +608,7 @@ class HomeworkPlugin(Star):
                 except Exception:
                     is_missing = False
                 if is_missing:
-                    dl = a.get("deadline", "")[:16].replace("T", " ")
+                    dl = format_beijing_time(a.get("deadline", ""))
                     results.append(f"{a_name}: 未提交 (截止时间 {dl})")
                 else:
                     results.append(f"{a_name}: 未在花名册中找到该学生")
@@ -603,7 +624,7 @@ class HomeworkPlugin(Star):
 
         lines = ["当前发布的作业列表："]
         for idx, a in enumerate(assignments, 1):
-            dl = a.get("deadline", "")[:16].replace("T", " ")
+            dl = format_beijing_time(a.get("deadline", ""))
             lines.append(f"{idx}. {a['name']} (ID: {a['id']})，截止时间：{dl}，应交人数：{a.get('total_expected', 0)} 人")
         return "\n".join(lines)
 
@@ -842,7 +863,7 @@ class HomeworkPlugin(Star):
             status_options[str(idx)] = a
             try:
                 s_data = api_get(f"/api/assignments/{a['id']}/status")
-                dl = s_data.get("deadline", "")[:16].replace("T", " ")
+                dl = format_beijing_time(s_data.get("deadline", ""))
                 lines.append(f"{idx}️⃣ {a['name']}：已交 {s_data['submitted_count']}/{s_data['total_expected']} 人 ({s_data['submission_rate']})")
                 lines.append(f"    • 迟交 {s_data['late_count']} 人 | 截止时间 {dl}")
             except Exception:
@@ -895,7 +916,7 @@ class HomeworkPlugin(Star):
         missing_options = {}
         for idx, a in enumerate(assignments, 1):
             missing_options[str(idx)] = a
-            dl = a.get("deadline", "")[:16].replace("T", " ")
+            dl = format_beijing_time(a.get("deadline", ""))
             lines.append(f"{idx}️⃣ {a['name']}（截止时间：{dl}）")
         lines.append("━━━━━━━━━━━━━━━")
         lines.append("💡 请直接回复对应【数字序号】（如：1 或 2），或使用 /未交 2")
@@ -965,7 +986,7 @@ class HomeworkPlugin(Star):
         for a in check_list:
             aid = a["id"]
             a_name = a["name"]
-            dl = a.get("deadline", "")[:16].replace("T", " ")
+            dl = format_beijing_time(a.get("deadline", ""))
             
             try:
                 sub_data = api_get(f"/api/assignments/{aid}/submissions")
@@ -980,7 +1001,7 @@ class HomeworkPlugin(Star):
                 found_any_record = True
                 s = matched_subs[0]
                 size_str = format_file_size(s.get("file_size", 0))
-                sub_time = s.get("submitted_at", "")[:16].replace("T", " ")
+                sub_time = format_beijing_time(s.get("submitted_at", ""))
                 late_tag = " ⚠️[迟交]" if s.get("is_late") else ""
                 results.append(
                     f"🔹【{a_name}】：\n"
@@ -1068,7 +1089,7 @@ class HomeworkPlugin(Star):
 
         menu_lines = ["📋【请选择要导出的作业归档】", "━━━━━━━━━━━━━━━"]
         for idx, a in enumerate(assignments, 1):
-            deadline_str = a.get('deadline', '')[:16].replace('T', ' ')
+            deadline_str = format_beijing_time(a.get('deadline', ''))
             menu_lines.append(f"{idx}️⃣ {a['name']}")
             menu_lines.append(f"    • 作业标识：{a['id']}")
             menu_lines.append(f"    • 应交人数：{a.get('total_expected', 0)} 人 | 截止时间 {deadline_str}")
@@ -1285,7 +1306,7 @@ class HomeworkPlugin(Star):
                     return
 
                 size_str = format_file_size(upload_res.get("file_size", 0))
-                sub_time = upload_res.get("submitted_at", "")[:19].replace("T", " ")
+                sub_time = format_beijing_time(upload_res.get("submitted_at", ""), with_seconds=True)
                 sha_short = upload_res.get("sha256", "")[:16]
                 ver = upload_res.get("version", 1)
                 is_update = upload_res.get("is_update", False)
@@ -1402,7 +1423,7 @@ class HomeworkPlugin(Star):
                     "━━━━━━━━━━━━━━━\n"
                     f"✅ 云端规则已生效：{create_res.get('name')}\n"
                     f"👥 关联应交人数：{create_res.get('roster_count')} 人\n"
-                    f"⏳ 截止时间：{create_res.get('deadline')[:16].replace('T', ' ')}\n"
+                    f"⏳ 截止时间：{format_beijing_time(create_res.get('deadline', ''))}\n"
                     f"📢 群通知与文件：{group_status_str}\n"
                     "━━━━━━━━━━━━━━━\n"
                     "💡 学生现在可以直接私聊把作业压缩包发给机器人，或发送至邮箱，全链路已开启！"
@@ -1473,7 +1494,7 @@ class HomeworkPlugin(Star):
                 return
 
             size_str = format_file_size(upload_res.get("file_size", 0))
-            sub_time = upload_res.get("submitted_at", "")[:19].replace("T", " ")
+            sub_time = format_beijing_time(upload_res.get("submitted_at", ""), with_seconds=True)
             sha_short = upload_res.get("sha256", "")[:16]
             ver = upload_res.get("version", 1)
             is_update = upload_res.get("is_update", False)
