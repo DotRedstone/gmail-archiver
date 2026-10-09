@@ -435,7 +435,7 @@ async def upload_file_action(event: AstrMessageEvent, download_url: str, filenam
     except Exception as e:
         yield make_reply(event, f"❌ 上传文件失败: {e}\n💡 备用下载直链：{download_url}")
 
-@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.4.1")
+@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.4.2")
 class HomeworkPlugin(Star):
     def __init__(self, context):
         super().__init__(context)
@@ -1152,6 +1152,12 @@ class HomeworkPlugin(Star):
         session_key = (sender_id, group_id)
         is_private = event.is_private_chat()
 
+        async def reply(msg):
+            if isinstance(msg, str):
+                await event.send(make_reply(event, msg))
+            else:
+                await event.send(msg)
+
         # 1. 检查是否有文件消息段
         file_comp = None
         if hasattr(event.message_obj, "message") and isinstance(event.message_obj.message, list):
@@ -1200,14 +1206,14 @@ class HomeworkPlugin(Star):
                     "  3️⃣ 在班级群发送上述通知文案\n"
                     "（回复 取消 可放弃发布，120 秒内有效）"
                 )
-                yield make_reply(event, preview_msg)
+                await reply(preview_msg)
                 return
 
             # 2.2 学生私聊提交作业文件
             # 校验是否为合法作业压缩包/文档
             valid_hw_exts = [".zip", ".rar", ".7z", ".tar.gz", ".tgz", ".tar", ".pdf"]
             if not any(raw_filename.lower().endswith(ext) for ext in valid_hw_exts):
-                yield make_reply(event, 
+                await reply(
                     f"⚠️ 收到文件【{raw_filename}】，但这好像不是标准的作业压缩包（建议格式：.zip、.rar、.7z、.tar.gz）。\n"
                     "请将源码和实验报告打包为压缩包后重新发送哦~"
                 )
@@ -1217,14 +1223,14 @@ class HomeworkPlugin(Star):
             try:
                 bind_data = await async_api_get(f"/api/bindings/{sender_id}")
             except Exception as e:
-                yield make_reply(event, f"❌ 检索绑定数据失败: {e}")
+                await reply(f"❌ 检索绑定数据失败: {e}")
                 return
 
             if bind_data.get("error"):
-                yield make_reply(event, f"⏳ 正在接收并把作业【{raw_filename}】暂存...")
+                await reply(f"⏳ 正在接收并把作业【{raw_filename}】暂存...")
                 local_path = await file_comp.get_file()
                 if not local_path or not os.path.exists(local_path):
-                    yield make_reply(event, "❌ 接收文件失败，请重新发送。")
+                    await reply("❌ 接收文件失败，请重新发送。")
                     return
 
                 PENDING_SESSIONS[session_key] = {
@@ -1233,7 +1239,7 @@ class HomeworkPlugin(Star):
                     "file_path": local_path,
                     "filename": raw_filename,
                 }
-                yield make_reply(event, 
+                await reply(
                     f"👋 同学你好！已安全接收你的作业【{raw_filename}】。\n"
                     "由于你是首次使用，请直接回复你的【学号】（例如：240809010501）：\n"
                     "核对花名册后将自动完成绑定，并将刚才的作业直接存入系统！\n"
@@ -1245,12 +1251,12 @@ class HomeworkPlugin(Star):
             student_name = bind_data.get("student_name", "")
             class_name = format_class_name(bind_data.get("class_name", ""), student_id)
 
-            yield make_reply(event, f"⏳ 正在核验作业文件【{raw_filename}】并上传归档...")
+            await reply(f"⏳ 正在核验作业文件【{raw_filename}】并上传归档...")
 
             try:
                 local_path = await file_comp.get_file()
                 if not local_path or not os.path.exists(local_path):
-                    yield make_reply(event, "❌ 接收文件失败：未能下载文件流。请稍后重试。")
+                    await reply("❌ 接收文件失败：未能下载文件流。请稍后重试。")
                     return
 
                 # 上传至后端（自动匹配最新开放作业）
@@ -1273,9 +1279,9 @@ class HomeworkPlugin(Star):
 
                 if not upload_res.get("success"):
                     if upload_res.get("duplicate"):
-                        yield make_reply(event, render_plagiarism_alert(upload_res))
+                        await reply(render_plagiarism_alert(upload_res))
                         return
-                    yield make_reply(event, f"⚠️ 作业归档失败: {upload_res.get('error', '未知错误')}")
+                    await reply(f"⚠️ 作业归档失败: {upload_res.get('error', '未知错误')}")
                     return
 
                 size_str = format_file_size(upload_res.get("file_size", 0))
@@ -1301,11 +1307,11 @@ class HomeworkPlugin(Star):
                     "━━━━━━━━━━━━━━━\n"
                     "✅ 作业已安全入库！若需修改代码或报告，在截止时间前直接再次发送新文件即可覆盖更新。"
                 )
-                yield make_reply(event, receipt_card)
+                await reply(receipt_card)
                 return
 
             except Exception as e:
-                yield make_reply(event, f"❌ 处理作业提交异常: {e}")
+                await reply(f"❌ 处理作业提交异常: {e}")
                 return
 
         # 3. 处理交互会话多轮回复
@@ -1328,7 +1334,7 @@ class HomeworkPlugin(Star):
                 except Exception:
                     pass
             del PENDING_SESSIONS[session_key]
-            yield make_reply(event, "❎ 已取消本次操作。")
+            await reply("❎ 已取消本次操作。")
             event.stop_event()
             return
 
@@ -1346,7 +1352,7 @@ class HomeworkPlugin(Star):
                 del PENDING_SESSIONS[session_key]
                 event.stop_event()
 
-                yield make_reply(event, f"⏳ 正在为【并行计算实验{lab_num}】注册云端规则并广播通知...")
+                await reply(f"⏳ 正在为【并行计算实验{lab_num}】注册云端规则并广播通知...")
 
                 # 1. 云端注册新作业规则
                 rule_cfg = {
@@ -1356,17 +1362,17 @@ class HomeworkPlugin(Star):
                     "target_filename": f"实验{lab_num}-{{class}}-{{student_id}}-{{name}}.{{ext}}",
                     "rosters": ["rosters/2024_cs_5.csv", "rosters/2024_green_compute_1.csv"],
                     "patterns": {
-                        "subject_regex": f"(?i)并行计算.*实验\\s*{lab_num}.*(?P<name>[\\p{{Han}}\\w]+)",
-                        "attachment_regex": f"(?i)实验\\s*{lab_num}.*(?P<ext>zip|rar|7z|tar\\.gz)",
+                        "subject_regex": fr"(?i)并行计算.*实验\s*{lab_num}.*(?P<name>[\p{Han}\w]+)",
+                        "attachment_regex": fr"(?i)实验\s*{lab_num}.*(?P<ext>zip|rar|7z|tar\.gz)",
                     }
                 }
                 try:
                     create_res = await async_api_post_json("/api/assignments", rule_cfg)
                     if not create_res.get("success"):
-                        yield make_reply(event, f"❌ 注册云端作业规则失败: {create_res.get('error')}")
+                        await reply(f"❌ 注册云端作业规则失败: {create_res.get('error')}")
                         return
                 except Exception as e:
-                    yield make_reply(event, f"❌ 调用作业注册接口异常: {e}")
+                    await reply(f"❌ 调用作业注册接口异常: {e}")
                     return
 
                 # 2. 分发至班级群
@@ -1391,7 +1397,7 @@ class HomeworkPlugin(Star):
 
                 group_status_str = f"已自动广播至班级群【{', '.join(success_groups)}】并上传群文件。" if success_groups else "（暂未配置班级群，可在群内发送 /设为班级群 配置）"
 
-                yield make_reply(event, 
+                await reply(
                     f"🎉【并行计算实验{lab_num}】发布成功！\n"
                     "━━━━━━━━━━━━━━━\n"
                     f"✅ 云端规则已生效：{create_res.get('name')}\n"
@@ -1407,20 +1413,20 @@ class HomeworkPlugin(Star):
         if s_type == "bind_and_submit":
             sid = extract_student_id(text)
             if not sid:
-                yield make_reply(event, "⚠️ 未识别到有效学号。请直接回复 12 位学号（例如：240809010501），回复 取消 可退出本次提交。")
+                await reply("⚠️ 未识别到有效学号。请直接回复 12 位学号（例如：240809010501），回复 取消 可退出本次提交。")
                 event.stop_event()
                 return
 
             del PENDING_SESSIONS[session_key]
             event.stop_event()
 
-            yield make_reply(event, f"⏳ 正在核对学号【{sid}】并绑定归档作业...")
+            await reply(f"⏳ 正在核对学号【{sid}】并绑定归档作业...")
 
             # 1. 尝试绑定
             bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
             if not bind_res.get("success"):
                 err = bind_res.get("error", "学号核验失败")
-                yield make_reply(event, f"❌ 绑定失败：{err}\n请核对学号后重新发送作业文件。")
+                await reply(f"❌ 绑定失败：{err}\n请核对学号后重新发送作业文件。")
                 fpath = session_info.get("file_path")
                 if fpath and os.path.exists(fpath):
                     try:
@@ -1455,11 +1461,11 @@ class HomeworkPlugin(Star):
 
             if not upload_res.get("success"):
                 if upload_res.get("duplicate"):
-                    yield make_reply(event, 
+                    await reply(
                         f"✅ 身份绑定成功：{st_name}（{cl_name}）！\n\n" + render_plagiarism_alert(upload_res)
                     )
                     return
-                yield make_reply(event, 
+                await reply(
                     f"✅ 身份连接成功：{st_name}（{cl_name}）！\n"
                     f"⚠️ 但作业归档失败：{upload_res.get('error', '未知错误')}\n"
                     "现在你的身份已绑定完成，请直接重新发送一次作业压缩包即可！"
@@ -1490,14 +1496,14 @@ class HomeworkPlugin(Star):
                 "━━━━━━━━━━━━━━━\n"
                 "✅ 身份已绑定，作业已安全入库！以后修改作业直接私聊发送压缩包即可，无需再输入任何信息。"
             )
-            yield make_reply(event, combined_card)
+            await reply(combined_card)
             return
 
         # 3.3 首次提问被拦截后回复学号建立连接
         if s_type == "bind_and_chat":
             sid = extract_student_id(text)
             if not sid:
-                yield make_reply(event, "⚠️ 未识别到有效学号。请直接回复 12 位学号（例如：240809010501），回复 取消 退出。")
+                await reply("⚠️ 未识别到有效学号。请直接回复 12 位学号（例如：240809010501），回复 取消 退出。")
                 event.stop_event()
                 return
 
@@ -1507,19 +1513,15 @@ class HomeworkPlugin(Star):
             bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
             if not bind_res.get("success"):
                 err = bind_res.get("error", "学号核验失败")
-                yield make_reply(event, f"❌ 绑定失败：{err}\n请核对学号后重新发送。")
+                await reply(f"❌ 绑定失败：{err}\n请核对学号后重新发送。")
                 return
 
             b = bind_res.get("binding", {})
             st_name = b.get("student_name", "")
             cl_name = format_class_name(b.get("class_name", ""), sid)
 
-            b = bind_res.get("binding", {})
-            st_name = b.get("student_name", "")
-            cl_name = format_class_name(b.get("class_name", ""), sid)
-
             status_card = await build_student_status_card(sid, st_name, cl_name)
-            yield make_reply(event, 
+            await reply(
                 f"🎉 绑定成功！欢迎【{st_name}】同学（{cl_name}）。\n\n"
                 f"{status_card}\n"
                 "━━━━━━━━━━━━━━━\n"
@@ -1534,19 +1536,19 @@ class HomeworkPlugin(Star):
         if s_type == "bind_and_report_status":
             sid = extract_student_id(text)
             if not sid:
-                yield make_reply(event, "⚠️ 未识别到有效学号。请直接回复 12 位学号（例如：240809010501），回复 取消 退出。")
+                await reply("⚠️ 未识别到有效学号。请直接回复 12 位学号（例如：240809010501），回复 取消 退出。")
                 event.stop_event()
                 return
 
             del PENDING_SESSIONS[session_key]
             event.stop_event()
 
-            yield make_reply(event, f"⏳ 正在核对学号【{sid}】并查询作业状态...")
+            await reply(f"⏳ 正在核对学号【{sid}】并查询作业状态...")
 
             bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
             if not bind_res.get("success"):
                 err = bind_res.get("error", "学号核验失败")
-                yield make_reply(event, f"❌ 绑定失败：{err}\n请核对学号是否在花名册中。")
+                await reply(f"❌ 绑定失败：{err}\n请核对学号是否在花名册中。")
                 return
 
             b = bind_res.get("binding", {})
@@ -1554,7 +1556,7 @@ class HomeworkPlugin(Star):
             cl_name = format_class_name(b.get("class_name", ""), sid)
 
             status_card = await build_student_status_card(sid, st_name, cl_name)
-            yield make_reply(event, 
+            await reply(
                 f"🎉 绑定成功！欢迎【{st_name}】同学（{cl_name}）！\n\n"
                 + status_card
             )
@@ -1569,27 +1571,27 @@ class HomeworkPlugin(Star):
             if s_type == "export":
                 url, filename, display_name = options[text]
                 async for res in upload_file_action(event, url, filename, display_name):
-                    yield res
+                    await reply(res)
                 return
             elif s_type == "status":
                 target = options[text]
                 try:
                     data = api_get(f"/api/assignments/{target['id']}/status")
-                    yield make_reply(event, render_status_card(data))
+                    await reply(render_status_card(data))
                 except Exception as e:
-                    yield make_reply(event, f"❌ 查询作业状态失败: {e}")
+                    await reply(f"❌ 查询作业状态失败: {e}")
                 return
             elif s_type == "missing":
                 target = options[text]
                 try:
                     data = api_get(f"/api/assignments/{target['id']}/missing")
-                    yield make_reply(event, render_missing_list(data))
+                    await reply(render_missing_list(data))
                 except Exception as e:
-                    yield make_reply(event, f"❌ 查询未交名单失败: {e}")
+                    await reply(f"❌ 查询未交名单失败: {e}")
                 return
 
         if text.isdigit() and session_info:
-            yield make_reply(event, f"⚠️ 未找到序号 [{text}] 对应的作业选项，请回复有效序号，或回复 取消 退出。")
+            await reply(f"⚠️ 未找到序号 [{text}] 对应的作业选项，请回复有效序号，或回复 取消 退出。")
             event.stop_event()
             return
 
@@ -1598,39 +1600,39 @@ class HomeworkPlugin(Star):
         if clean_text in ["查作业", "作业统计", "作业概览", "查看作业", "作业进度", "全部作业"]:
             event.stop_event()
             async for r in self.status_cmd(event):
-                yield r
+                await reply(r)
             return
         elif clean_text in ["未交", "未交名单", "谁没交", "催交", "没交作业"]:
             event.stop_event()
             async for r in self.missing_cmd(event):
-                yield r
+                await reply(r)
             return
         elif clean_text in ["帮助", "菜单", "作业帮助", "指令", "指令菜单"]:
             event.stop_event()
             async for r in self.help_cmd(event):
-                yield r
+                await reply(r)
             return
         elif clean_text in ["我的信息", "我的绑定", "我是谁", "查询绑定"]:
             event.stop_event()
             async for r in self.my_info(event):
-                yield r
+                await reply(r)
             return
         elif clean_text in ["解绑", "解除绑定"]:
             event.stop_event()
             async for r in self.unbind_student(event):
-                yield r
+                await reply(r)
             return
         elif clean_text.startswith("绑定 ") or clean_text.startswith("绑定:"):
             event.stop_event()
             param = clean_text.split(maxsplit=1)[1] if " " in clean_text else clean_text.split(":", 1)[1]
             async for r in self.bind_student(event, param):
-                yield r
+                await reply(r)
             return
         elif clean_text.startswith("查收 ") or clean_text.startswith("查 "):
             event.stop_event()
             param = clean_text.split(maxsplit=1)[1]
             async for r in self.check_student(event, param):
-                yield r
+                await reply(r)
             return
 
         # 5. 自然语言口语化查询：“看看我交了吗？” / “我交了吗” / “交了没” / “查收”
@@ -1649,7 +1651,7 @@ class HomeworkPlugin(Star):
                 target_name = bind_data.get("student_name", "") if not explicit_sid else ""
                 target_class = format_class_name(bind_data.get("class_name", ""), target_sid)
                 card = await build_student_status_card(target_sid, target_name, target_class)
-                yield make_reply(event, card)
+                await reply(card)
                 return
             else:
                 # 机器人还不认识该同学（未绑定）
@@ -1661,7 +1663,7 @@ class HomeworkPlugin(Star):
                         st_name = b.get("student_name", "")
                         cl_name = format_class_name(b.get("class_name", ""), explicit_sid)
                         card = await build_student_status_card(explicit_sid, st_name, cl_name)
-                        yield make_reply(event, f"🎉 自动完成身份绑定：【{st_name}】同学（{cl_name}）！\n\n" + card)
+                        await reply(f"🎉 自动完成身份绑定：【{st_name}】同学（{cl_name}）！\n\n" + card)
                         return
 
                 if is_private:
@@ -1669,13 +1671,13 @@ class HomeworkPlugin(Star):
                         "time": time.time(),
                         "type": "bind_and_report_status",
                     }
-                    yield make_reply(event, 
+                    await reply(
                         "👋 同学你好呀！我还不认识你呢，你是哪位同学呀？\n"
                         "请直接回复你的【学号】（例如：240809010501），我马上帮你核对并查询你的作业！"
                     )
                     return
                 else:
-                    yield make_reply(event, 
+                    await reply(
                         "同学你好！我还不认识你呢，为了保护你的个人信息，请直接【私聊我】发送学号绑定，即可随时查询你的作业状态哦~"
                     )
                     return
@@ -1692,14 +1694,14 @@ class HomeworkPlugin(Star):
 
                 if check_b.get("error"):
                     event.stop_event()
-                    yield make_reply(event, f"⏳ 正在核对学号【{sid}】...")
+                    await reply(f"⏳ 正在核对学号【{sid}】...")
                     bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
                     if bind_res.get("success"):
                         b = bind_res.get("binding", {})
                         cl_name = format_class_name(b.get("class_name", ""), sid)
                         st_name = b.get("student_name", "")
                         card = await build_student_status_card(sid, st_name, cl_name)
-                        yield make_reply(event, 
+                        await reply(
                             f"🎉【学生身份绑定成功】\n"
                             "━━━━━━━━━━━━━━━\n"
                             f"👤 学生姓名：{st_name}\n"
@@ -1710,5 +1712,6 @@ class HomeworkPlugin(Star):
                         )
                         return
                     else:
-                        yield make_reply(event, f"⚠️ 绑定失败：{bind_res.get('error')}")
+                        await reply(f"⚠️ 绑定失败：{bind_res.get('error')}")
                         return
+
