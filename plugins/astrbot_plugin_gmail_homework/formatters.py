@@ -264,3 +264,147 @@ def render_plagiarism_alert(upload_res: dict) -> str:
         "━━━━━━━━━━━━━━━\n"
         f"💡 说明：{desc_str}"
     )
+
+def render_class_bindings_card(roster_data: dict, bindings_data: dict, filter_class: str = "") -> str:
+    bindings = bindings_data.get("bindings") or []
+    roster_students = roster_data.get("students") or []
+    roster_classes = roster_data.get("classes") or {}
+    total_expected = roster_data.get("total") or len(roster_students)
+
+    bound_by_sid = {}
+    bound_by_class = {}
+    for b in bindings:
+        sid = b.get("student_id", "")
+        bound_by_sid[sid] = b
+        c_name = format_class_name(b.get("class_name", ""), sid)
+        bound_by_class.setdefault(c_name, []).append(b)
+
+    known_classes = list(roster_classes.keys())
+    for c in ["245班", "24绿算"]:
+        if c not in known_classes:
+            known_classes.append(c)
+
+    target_filter = filter_class.strip()
+    if target_filter:
+        norm_filter = format_class_name(target_filter)
+        matched_classes = [c for c in known_classes if norm_filter in c or target_filter in c]
+        if not matched_classes:
+            return f"⚠️ 未找到与 [{filter_class}] 匹配的班级，可选班级：{'、'.join(known_classes)}"
+        known_classes = matched_classes
+
+    if target_filter and len(known_classes) == 1:
+        c = known_classes[0]
+        c_bounds = bound_by_class.get(c, [])
+        c_total = roster_classes.get(c, len([s for s in roster_students if format_class_name(s.get("class_name", "")) == c]))
+        rate_str = f" ({len(c_bounds) / c_total * 100:.1f}%)" if c_total > 0 else ""
+        lines = [
+            f"📋【{c} · 人员绑定清单】",
+            "━━━━━━━━━━━━━━━",
+            f"👥 班级总览：已绑定 {len(c_bounds)} / {c_total} 人{rate_str}",
+            "━━━━━━━━━━━━━━━",
+        ]
+        if c_bounds:
+            for idx, b in enumerate(c_bounds, 1):
+                lines.append(f"  {idx}. {b.get('student_name')}（{b.get('student_id')}）- QQ: {b.get('qq_id')}")
+        else:
+            lines.append("  （当前班级暂无学生绑定）")
+        lines.append("━━━━━━━━━━━━━━━")
+        lines.append(f"💡 提示：如需查看未绑定名单，可发送：未绑定名单 {c}")
+        return "\n".join(lines)
+
+    total_bound = len(bindings)
+    global_rate = f" ({total_bound / total_expected * 100:.1f}%)" if total_expected > 0 else ""
+    lines = [
+        "📋【班级人员绑定清单】",
+        "━━━━━━━━━━━━━━━",
+        f"👥 全体总览：已绑定 {total_bound} / {total_expected} 人{global_rate}",
+    ]
+
+    for c in known_classes:
+        c_bounds = bound_by_class.get(c, [])
+        c_total = roster_classes.get(c, len([s for s in roster_students if format_class_name(s.get("class_name", "")) == c]))
+        c_rate = f"，占比 {len(c_bounds) / c_total * 100:.1f}%" if c_total > 0 else ""
+        lines.append(f"\n🏫【{c}】（已绑定 {len(c_bounds)} / {c_total} 人{c_rate}）：")
+        if c_bounds:
+            for idx, b in enumerate(c_bounds, 1):
+                lines.append(f"  {idx}. {b.get('student_name')}（{b.get('student_id')}）- QQ: {b.get('qq_id')}")
+        else:
+            lines.append("  （暂无同学绑定）")
+
+    lines.append("\n━━━━━━━━━━━━━━━")
+    lines.append("💡 提示：")
+    lines.append("• 按班级筛选：班级人员 245班 或 班级人员 绿算")
+    lines.append("• 催交未绑定同学：未绑定名单")
+    return "\n".join(lines)
+
+def render_unbound_students_card(roster_data: dict, bindings_data: dict, filter_class: str = "") -> str:
+    bindings = bindings_data.get("bindings") or []
+    roster_students = roster_data.get("students") or []
+    roster_classes = roster_data.get("classes") or {}
+    total_expected = roster_data.get("total") or len(roster_students)
+
+    bound_sids = {b.get("student_id") for b in bindings if b.get("student_id")}
+
+    known_classes = list(roster_classes.keys())
+    for c in ["245班", "24绿算"]:
+        if c not in known_classes:
+            known_classes.append(c)
+
+    target_filter = filter_class.strip()
+    if target_filter:
+        norm_filter = format_class_name(target_filter)
+        matched_classes = [c for c in known_classes if norm_filter in c or target_filter in c]
+        if not matched_classes:
+            return f"⚠️ 未找到与 [{filter_class}] 匹配的班级，可选班级：{'、'.join(known_classes)}"
+        known_classes = matched_classes
+
+    unbound_by_class = {}
+    total_unbound = 0
+    for s in roster_students:
+        sid = s.get("student_id", "")
+        if sid and sid not in bound_sids:
+            c_name = format_class_name(s.get("class_name", ""), sid)
+            unbound_by_class.setdefault(c_name, []).append(s)
+            total_unbound += 1
+
+    if total_unbound == 0:
+        return "🎉 太棒了！全员均已完成 QQ 身份绑定！"
+
+    if target_filter and len(known_classes) == 1:
+        c = known_classes[0]
+        unbounds = unbound_by_class.get(c, [])
+        c_total = roster_classes.get(c, len([s for s in roster_students if format_class_name(s.get("class_name", "")) == c]))
+        lines = [
+            f"📢【{c} · 未绑定学生名单】",
+            "━━━━━━━━━━━━━━━",
+            f"👥 班级总览：尚有 {len(unbounds)} / {c_total} 人未绑定 QQ",
+            "━━━━━━━━━━━━━━━",
+        ]
+        if unbounds:
+            names = [s.get("name", "") for s in unbounds]
+            lines.append("、".join(names))
+        else:
+            lines.append("🎉 该班级全员均已完成身份绑定！")
+        lines.append("━━━━━━━━━━━━━━━")
+        lines.append("💡 提醒：请以上同学私聊机器人发送「/绑定 学号 姓名」完成绑定。")
+        return "\n".join(lines)
+
+    lines = [
+        "📢【全员未绑定学生催交清单】",
+        "━━━━━━━━━━━━━━━",
+        f"👥 全体总览：尚有 {total_unbound} / {total_expected} 人未绑定 QQ",
+    ]
+
+    for c in known_classes:
+        unbounds = unbound_by_class.get(c, [])
+        c_total = roster_classes.get(c, len([s for s in roster_students if format_class_name(s.get("class_name", "")) == c]))
+        lines.append(f"\n🏫【{c}】（未绑定 {len(unbounds)} / {c_total} 人）：")
+        if unbounds:
+            names = [s.get("name", "") for s in unbounds]
+            lines.append("、".join(names))
+        else:
+            lines.append("🎉 该班全员均已绑定！")
+
+    lines.append("\n━━━━━━━━━━━━━━━")
+    lines.append("💡 提醒：请以上同学私聊机器人发送「/绑定 学号 姓名」完成绑定，或直接私聊发作业压缩包秒级归档。")
+    return "\n".join(lines)

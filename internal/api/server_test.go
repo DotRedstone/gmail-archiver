@@ -406,6 +406,19 @@ target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
 	if recPlag.Code != http.StatusOK {
 		t.Fatalf("expected 200 for plagiarism report, got %d: %s", recPlag.Code, recPlag.Body.String())
 	}
+
+	// 20. Test Roster API
+	reqRoster := httptest.NewRequest("GET", "/api/roster?token=secret-token-123", nil)
+	recRoster := httptest.NewRecorder()
+	handler.ServeHTTP(recRoster, reqRoster)
+	if recRoster.Code != http.StatusOK {
+		t.Fatalf("expected 200 for roster api, got %d: %s", recRoster.Code, recRoster.Body.String())
+	}
+	var rosterResp map[string]any
+	_ = json.Unmarshal(recRoster.Body.Bytes(), &rosterResp)
+	if int(rosterResp["total"].(float64)) != 2 {
+		t.Errorf("expected 2 students in roster, got %v", rosterResp["total"])
+	}
 }
 
 

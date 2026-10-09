@@ -79,6 +79,10 @@ func (s *Server) Routes() http.Handler {
 			b.Delete("/{qq_id}", s.handleDeleteBinding)
 		})
 
+		api.Route("/api/roster", func(ros chi.Router) {
+			ros.Get("/", s.handleGetRoster)
+		})
+
 		api.Route("/api/assignments", func(as chi.Router) {
 			as.Get("/", s.handleListAssignments)
 			as.Post("/", s.handleCreateAssignment)
@@ -715,6 +719,30 @@ func (s *Server) handleListBindings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"bindings": list,
 		"total":    len(list),
+	})
+}
+
+func (s *Server) handleGetRoster(w http.ResponseWriter, r *http.Request) {
+	seen := make(map[string]bool)
+	var students []roster.Student
+	classes := make(map[string]int)
+
+	for _, rl := range s.rules.Rules() {
+		for _, st := range rl.Roster.All() {
+			if !seen[st.StudentID] {
+				seen[st.StudentID] = true
+				normClass := roster.NormalizeClassName(st.ClassName)
+				st.ClassName = normClass
+				students = append(students, st)
+				classes[normClass]++
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"students": students,
+		"total":    len(students),
+		"classes":  classes,
 	})
 }
 

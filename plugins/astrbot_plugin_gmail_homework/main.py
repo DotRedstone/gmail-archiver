@@ -50,6 +50,8 @@ try:
         build_student_status_card,
         format_plagiarism_type,
         render_plagiarism_alert,
+        render_class_bindings_card,
+        render_unbound_students_card,
     )
     from .actions import make_reply, upload_file_action
 except ImportError:
@@ -88,6 +90,8 @@ except ImportError:
         build_student_status_card,
         format_plagiarism_type,
         render_plagiarism_alert,
+        render_class_bindings_card,
+        render_unbound_students_card,
     )
     from actions import make_reply, upload_file_action
 
@@ -300,7 +304,9 @@ class HomeworkPlugin(Star):
             "• 一键查重 / 查重 [序号] —— 全员代码哈希指纹查重，排查抄袭嫌疑\n"
             "• 私聊发实验卡文件 —— 自动提取实验号并一键分发群文件与广播\n"
             "• 设为班级群 —— 在群内执行，将当前群标记为作业通告群\n"
-            "• 助教列表 —— 查看教学管理团队人员\n\n"
+            "• 助教列表 —— 查看教学管理团队人员\n"
+            "• 班级人员列表 / 绑定列表 [班级] —— 查看全班已绑定 QQ 的学生清单（按班级分组）\n"
+            "• 未绑定名单 [班级] —— 查看全班尚未绑定 QQ 的学生催交名单\n\n"
             "👑【超级管理员专属】：\n"
             "• 添加助教 <QQ> —— 任命新的课程助教\n"
             "• 移除助教 <QQ> —— 移除指定的课程助教"
@@ -401,28 +407,52 @@ class HomeworkPlugin(Star):
         else:
             yield make_reply(event, f"⚠️ 解绑失败：{resp.get('error', '未找到绑定记录')}")
 
-    @filter.command("绑定列表")
-    async def list_bindings_cmd(self, event: AstrMessageEvent):
-        if not is_admin(event):
-            yield make_reply(event, "❌ 权限不足：此指令仅限助教或管理员使用。")
+    @filter.command("班级人员", alias={"班级人员列表", "人员列表", "绑定列表", "已绑定列表", "绑定名单", "已绑定名单", "班级名单", "学生列表"})
+    async def class_members_cmd(self, event: AstrMessageEvent, param: str = ""):
+        """查看全班已绑定 QQ 的学生列表（按班级分组）：/班级人员 [班级名]"""
+        if not is_ta_or_admin(event):
+            yield make_reply(event, "❌ 权限不足：为保护同学隐私，班级人员绑定清单仅限助教或管理员查看。\n💡 如需查看自己的绑定状态，请发送「我的信息」或「/查收」。")
             return
 
         try:
-            resp = await async_api_get("/api/bindings")
+            roster_data = await async_api_get("/api/roster")
+        except Exception:
+            roster_data = {}
+
+        try:
+            bindings_data = await async_api_get("/api/bindings")
         except Exception as e:
-            yield make_reply(event, f"❌ 获取绑定列表失败: {e}")
+            yield make_reply(event, f"❌ 获取绑定数据失败: {e}")
             return
 
-        bindings = resp.get("bindings", [])
-        if not bindings:
-            yield make_reply(event, "当前暂无学生完成身份绑定。")
+        card = render_class_bindings_card(roster_data, bindings_data, param)
+        yield make_reply(event, card)
+
+    @filter.command("未绑定", alias={"未绑定名单", "未绑定人员", "未绑定学生", "谁没绑定"})
+    async def unbound_members_cmd(self, event: AstrMessageEvent, param: str = ""):
+        """查看全班尚未绑定 QQ 的学生催交名单：/未绑定 [班级名]"""
+        if not is_ta_or_admin(event):
+            yield make_reply(event, "❌ 权限不足：为保护同学隐私，未绑定名单仅限助教或管理员查看。")
             return
 
-        lines = [f"📋【已绑定学生清单（共 {len(bindings)} 人）】", "━━━━━━━━━━━━━━━"]
-        for idx, b in enumerate(bindings, 1):
-            cl = format_class_name(b.get("class_name", ""), b.get("student_id", ""))
-            lines.append(f"{idx}. {b.get('student_name')}（{b.get('student_id')}，{cl}）- QQ:{b.get('qq_id')}")
-        yield make_reply(event, "\n".join(lines))
+        try:
+            roster_data = await async_api_get("/api/roster")
+        except Exception:
+            roster_data = {}
+
+        try:
+            bindings_data = await async_api_get("/api/bindings")
+        except Exception as e:
+            yield make_reply(event, f"❌ 获取绑定数据失败: {e}")
+            return
+
+        card = render_unbound_students_card(roster_data, bindings_data, param)
+        yield make_reply(event, card)
+
+    @filter.command("绑定列表")
+    async def list_bindings_cmd(self, event: AstrMessageEvent, param: str = ""):
+        async for r in self.class_members_cmd(event, param):
+            yield r
 
     # [Class Group Commands]
     @filter.command("设为班级群")
@@ -1455,9 +1485,26 @@ class HomeworkPlugin(Star):
             async for r in self.remove_ta_cmd(event, p):
                 await reply(r)
             return
-        elif clean_text in ["绑定列表", "已绑定学生"]:
+        elif clean_text in ["班级人员", "班级人员列表", "人员列表", "学生列表", "绑定列表", "已绑定列表", "绑定名单", "已绑定名单", "班级名单", "绑定情况", "已绑定人员"]:
             event.stop_event()
-            async for r in self.list_bindings_cmd(event):
+            async for r in self.class_members_cmd(event):
+                await reply(r)
+            return
+        elif clean_text.startswith("班级人员 ") or clean_text.startswith("人员列表 ") or clean_text.startswith("绑定列表 ") or clean_text.startswith("已绑定 "):
+            event.stop_event()
+            p = clean_text.split(maxsplit=1)[1]
+            async for r in self.class_members_cmd(event, p):
+                await reply(r)
+            return
+        elif clean_text in ["未绑定", "未绑定名单", "未绑定人员", "未绑定学生", "谁没绑定", "未绑定列表"]:
+            event.stop_event()
+            async for r in self.unbound_members_cmd(event):
+                await reply(r)
+            return
+        elif clean_text.startswith("未绑定 ") or clean_text.startswith("未绑定名单 ") or clean_text.startswith("未绑定人员 "):
+            event.stop_event()
+            p = clean_text.split(maxsplit=1)[1]
+            async for r in self.unbound_members_cmd(event, p):
                 await reply(r)
             return
         elif clean_text in ["设为班级群", "设置班群", "绑定班群"]:
