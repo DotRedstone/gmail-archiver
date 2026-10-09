@@ -86,10 +86,10 @@ target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
 	if normErr != nil {
 		t.Fatalf("NormalizeSubmission: %v", normErr)
 	}
-	if finalID != "240809010501" || finalName != "支全振" || finalClass != "2024级计算机科学与技术5班" {
+	if finalID != "240809010501" || finalName != "支全振" || finalClass != "245班" {
 		t.Errorf("expected auto roster lookup, got %s, %s, %s", finalID, finalName, finalClass)
 	}
-	if targetName != "实验1-2024级计算机科学与技术5班-240809010501-支全振.zip" || isLate {
+	if targetName != "实验1-245班-240809010501-支全振.zip" || isLate {
 		t.Errorf("unexpected targetName=%s, isLate=%v", targetName, isLate)
 	}
 

@@ -107,7 +107,7 @@ func (r *Roster) LoadCSV(path string) ([]Student, error) {
 		}
 		className := ""
 		if classCol >= 0 && classCol < len(record) {
-			className = strings.TrimSpace(record[classCol])
+			className = NormalizeClassName(record[classCol])
 		}
 
 		s := Student{
@@ -161,4 +161,16 @@ func (r *Roster) Count() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.students)
+}
+
+// NormalizeClassName maps class name variations to the standard short form ("245班" or "24绿算").
+func NormalizeClassName(raw string) string {
+	clean := strings.TrimSpace(raw)
+	if strings.Contains(clean, "绿") || strings.Contains(clean, "算力") {
+		return "24绿算"
+	}
+	if strings.Contains(clean, "5") || strings.Contains(clean, "五") {
+		return "245班"
+	}
+	return clean
 }

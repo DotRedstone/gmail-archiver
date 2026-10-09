@@ -20,6 +20,7 @@ import (
 	"github.com/dot/gmail-archiver/internal/config"
 	"github.com/dot/gmail-archiver/internal/db"
 	"github.com/dot/gmail-archiver/internal/imap"
+	"github.com/dot/gmail-archiver/internal/roster"
 	"github.com/dot/gmail-archiver/internal/rule"
 	"github.com/dot/gmail-archiver/internal/storage"
 	"github.com/dot/gmail-archiver/internal/verifier"
@@ -780,6 +781,15 @@ func (s *Server) handleCreateBinding(w http.ResponseWriter, r *http.Request) {
 	} else if req.StudentName == "" {
 		writeJSONError(w, http.StatusBadRequest, "花名册中未检索到该学号，请同时提供姓名")
 		return
+	}
+
+	req.ClassName = roster.NormalizeClassName(req.ClassName)
+	if req.ClassName == "" {
+		if strings.HasPrefix(req.StudentID, "2408090105") {
+			req.ClassName = "245班"
+		} else if strings.HasPrefix(req.StudentID, "2408090121") || req.StudentID == "240810010303" {
+			req.ClassName = "24绿算"
+		}
 	}
 
 	// Anti-impersonation check: ensure student_id is not already bound by another QQ

@@ -348,7 +348,7 @@ target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
 	}
 	var bindResp db.StudentBinding
 	_ = json.Unmarshal(recGetBind.Body.Bytes(), &bindResp)
-	if bindResp.StudentID != "240809010501" || bindResp.StudentName != "支全振" || bindResp.ClassName != "2024级计算机科学与技术5班" {
+	if bindResp.StudentID != "240809010501" || bindResp.StudentName != "支全振" || bindResp.ClassName != "245班" {
 		t.Errorf("unexpected binding response: %+v", bindResp)
 	}
 
@@ -376,7 +376,7 @@ target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
 	if uploadResp["student_id"] != "240809010501" {
 		t.Errorf("expected student_id 240809010501, got %v", uploadResp["student_id"])
 	}
-	expectedFilename := "实验1-2024级计算机科学与技术5班-240809010501-支全振.zip"
+	expectedFilename := "实验1-245班-240809010501-支全振.zip"
 	if uploadResp["target_filename"] != expectedFilename {
 		t.Errorf("expected target_filename %s, got %v", expectedFilename, uploadResp["target_filename"])
 	}

@@ -189,14 +189,34 @@ def format_file_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024):.2f} MB"
 
 def extract_student_id(text: str) -> str:
-    """从文本中提取 10~13 位纯数字学号"""
-    m = re.search(r"\b(2\d{9,12})\b", text.strip())
+    """从文本中提取 12 位纯数字学号（以 24 开头的 12 位学号为主，兼容 10~13 位）"""
+    m = re.search(r"\b(24\d{10})\b", text.strip())
     if m:
         return m.group(1)
-    m2 = re.search(r"(\d{10,13})", text.strip())
+    m2 = re.search(r"\b(2\d{11})\b", text.strip())
     if m2:
         return m2.group(1)
+    m3 = re.search(r"(\d{12})", text.strip())
+    if m3:
+        return m3.group(1)
+    m4 = re.search(r"(\d{10,13})", text.strip())
+    if m4:
+        return m4.group(1)
     return ""
+
+def format_class_name(raw: str, student_id: str = "") -> str:
+    """统一规范班级展示为 245班 或 24绿算"""
+    clean = (raw or "").strip()
+    if "绿" in clean or "算" in clean:
+        return "24绿算"
+    if "5" in clean or "五" in clean:
+        return "245班"
+    sid = (student_id or "").strip()
+    if sid.startswith("2408090105"):
+        return "245班"
+    if sid.startswith("2408090121") or sid == "240810010303":
+        return "24绿算"
+    return clean or "245班"
 
 def calculate_next_wednesday_deadline() -> tuple:
     """
@@ -228,11 +248,11 @@ def generate_notice_text(lab_num: str, deadline_friendly: str) -> str:
         f"示例：并行计算-实验{lab_num}-张三\n\n"
         "压缩包命名：\n"
         f"实验{lab_num}-班级-学号-姓名.zip\n"
-        f"示例：实验{lab_num}-241-240809010000-张三.zip\n\n"
+        f"示例：实验{lab_num}-245班-240809010501-张三.zip 或 实验{lab_num}-24绿算-240809012103-李四.zip\n\n"
         "邮件正文（若走邮箱）：\n"
         "姓名：张三\n"
-        "学号：240809010000\n"
-        "班级：241\n"
+        "学号：240809010501\n"
+        "班级：245班\n"
         f"提交内容：实验{lab_num}源码及实验报告\n\n"
         "请严格按照以上格式提交，邮件主题、正文信息及附件命名不要自行修改格式，方便后续统一统计和整理。"
     )
@@ -259,7 +279,8 @@ def render_missing_list(data: dict) -> str:
 
     lines = [f"📢【{data['assignment_name']}】未交作业学生名单（共 {len(real_missing)} 人）：", "━━━━━━━━━━━━━━━"]
     for idx, s in enumerate(real_missing, 1):
-        lines.append(f"{idx}. {s['name']}（{s['student_id']}，{s['class_name']}）")
+        cl = format_class_name(s.get("class_name", ""), s.get("student_id", ""))
+        lines.append(f"{idx}. {s['name']}（{s['student_id']}，{cl}）")
     lines.append("━━━━━━━━━━━━━━━\n💡 提醒：请以上同学抓紧整理源码与实验报告，直接私聊机器人发送作业压缩包即可自动归档提交。")
     return "\n".join(lines)
 
@@ -538,12 +559,13 @@ class HomeworkPlugin(Star):
             return
 
         b = resp.get("binding", {})
+        cl = format_class_name(b.get("class_name", ""), b.get("student_id", ""))
         yield make_reply(event, 
             "🎉【学生身份绑定成功】\n"
             "━━━━━━━━━━━━━━━\n"
             f"👤 姓名：{b.get('student_name')}\n"
             f"🆔 学号：{b.get('student_id')}\n"
-            f"🏫 班级：{b.get('class_name')}\n"
+            f"🏫 班级：{cl}\n"
             f"📱 绑定 QQ：{sender_id}\n"
             "━━━━━━━━━━━━━━━\n"
             "💡 现在你可以直接【私聊把作业压缩包发给我】秒级自动入库，无需再发送邮件！"
@@ -566,12 +588,13 @@ class HomeworkPlugin(Star):
             )
             return
 
+        cl = format_class_name(resp.get("class_name", ""), resp.get("student_id", ""))
         yield make_reply(event, 
             "📋【你的学生身份信息】\n"
             "━━━━━━━━━━━━━━━\n"
             f"👤 姓名：{resp.get('student_name')}\n"
             f"🆔 学号：{resp.get('student_id')}\n"
-            f"🏫 班级：{resp.get('class_name')}\n"
+            f"🏫 班级：{cl}\n"
             f"📱 QQ号：{sender_id}\n"
             "━━━━━━━━━━━━━━━\n"
             "💡 如需提交作业，直接在私聊会话中把压缩包发送给机器人即可。"
@@ -620,7 +643,8 @@ class HomeworkPlugin(Star):
 
         lines = [f"📋【已绑定学生清单（共 {len(bindings)} 人）】", "━━━━━━━━━━━━━━━"]
         for idx, b in enumerate(bindings, 1):
-            lines.append(f"{idx}. {b.get('student_name')}（{b.get('student_id')}，{b.get('class_name')}）- QQ:{b.get('qq_id')}")
+            cl = format_class_name(b.get("class_name", ""), b.get("student_id", ""))
+            lines.append(f"{idx}. {b.get('student_name')}（{b.get('student_id')}，{cl}）- QQ:{b.get('qq_id')}")
         yield make_reply(event, "\n".join(lines))
 
     # ---------------- 班级群配置模块 ----------------
@@ -1113,7 +1137,7 @@ class HomeworkPlugin(Star):
 
             student_id = bind_data.get("student_id", "")
             student_name = bind_data.get("student_name", "")
-            class_name = bind_data.get("class_name", "")
+            class_name = format_class_name(bind_data.get("class_name", ""), student_id)
 
             yield make_reply(event, f"⏳ 正在核验作业文件【{raw_filename}】并上传归档...")
 
@@ -1301,7 +1325,7 @@ class HomeworkPlugin(Star):
 
             b = bind_res.get("binding", {})
             st_name = b.get("student_name", "")
-            cl_name = b.get("class_name", "")
+            cl_name = format_class_name(b.get("class_name", ""), sid)
             fpath = session_info.get("file_path")
             fname = session_info.get("filename")
 
@@ -1382,7 +1406,7 @@ class HomeworkPlugin(Star):
 
             b = bind_res.get("binding", {})
             st_name = b.get("student_name", "")
-            cl_name = b.get("class_name", "")
+            cl_name = format_class_name(b.get("class_name", ""), sid)
 
             yield make_reply(event, 
                 f"🎉 绑定成功！欢迎【{st_name}】同学（{cl_name}）。\n"
@@ -1443,12 +1467,13 @@ class HomeworkPlugin(Star):
                     bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
                     if bind_res.get("success"):
                         b = bind_res.get("binding", {})
+                        cl_name = format_class_name(b.get("class_name", ""), sid)
                         yield make_reply(event, 
                             f"🎉【学生身份绑定成功】\n"
                             "━━━━━━━━━━━━━━━\n"
                             f"👤 学生姓名：{b.get('student_name')}\n"
                             f"🆔 学号：{sid}\n"
-                            f"🏫 班级：{b.get('class_name')}\n"
+                            f"🏫 班级：{cl_name}\n"
                             "━━━━━━━━━━━━━━━\n"
                             "💡 欢迎使用并行计算课程助手！现在你可以：\n"
                             "1️⃣ 私聊发送作业压缩包 —— 自动秒级提交入库\n"

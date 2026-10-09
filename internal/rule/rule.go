@@ -301,6 +301,7 @@ func (r *AssignmentRule) Match(subject, filename, bodyText string, receivedAt ti
 	if className != "" {
 		finalClass = className
 	}
+	finalClass = roster.NormalizeClassName(finalClass)
 
 	ext := strings.TrimPrefix(filepath.Ext(filename), ".")
 	if extractedExt, ok := extracted["ext"]; ok && extractedExt != "" {
@@ -361,6 +362,14 @@ func (r *AssignmentRule) NormalizeSubmission(studentID, studentName, className, 
 		finalClass = strings.TrimSpace(className)
 		if finalID == "" && finalName == "" {
 			return "", "", "", "", false, fmt.Errorf("student identification (id or name) required")
+		}
+	}
+	finalClass = roster.NormalizeClassName(finalClass)
+	if finalClass == "" {
+		if strings.HasPrefix(finalID, "2408090105") {
+			finalClass = "245班"
+		} else if strings.HasPrefix(finalID, "2408090121") || finalID == "240810010303" {
+			finalClass = "24绿算"
 		}
 	}
 
