@@ -9,3 +9,5 @@ cmd/diagnose/
 cmd/full_audit/
 cmd/inspect/
 cmd/inspect_body/
+__pycache__/
+*.pyc
