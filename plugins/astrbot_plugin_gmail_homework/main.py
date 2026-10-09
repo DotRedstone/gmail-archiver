@@ -1379,9 +1379,21 @@ class HomeworkPlugin(Star):
             async for r in self.status_cmd(event):
                 await reply(r)
             return
+        elif clean_text.startswith("查作业 ") or clean_text.startswith("作业统计 "):
+            event.stop_event()
+            p = clean_text.split(maxsplit=1)[1]
+            async for r in self.status_cmd(event, p):
+                await reply(r)
+            return
         elif clean_text in ["未交", "未交名单", "谁没交", "催交", "没交作业"]:
             event.stop_event()
             async for r in self.missing_cmd(event):
+                await reply(r)
+            return
+        elif clean_text.startswith("未交 ") or clean_text.startswith("未交名单 ") or clean_text.startswith("谁没交 "):
+            event.stop_event()
+            p = clean_text.split(maxsplit=1)[1]
+            async for r in self.missing_cmd(event, p):
                 await reply(r)
             return
         elif clean_text in ["帮助", "菜单", "作业帮助", "指令", "指令菜单"]:
@@ -1415,6 +1427,12 @@ class HomeworkPlugin(Star):
             async for r in self.export_cmd(event):
                 await reply(r)
             return
+        elif clean_text.startswith("导出作业 ") or clean_text.startswith("下载作业 ") or clean_text.startswith("导出 ") or clean_text.startswith("下载 "):
+            event.stop_event()
+            p = clean_text.split(maxsplit=1)[1]
+            async for r in self.export_cmd(event, p):
+                await reply(r)
+            return
         elif clean_text in ["导出整学期", "导出全部作业", "下载全部作业"]:
             event.stop_event()
             async for r in self.export_all_direct_cmd(event):
@@ -1423,6 +1441,33 @@ class HomeworkPlugin(Star):
         elif clean_text in ["助教列表", "助教团队"]:
             event.stop_event()
             async for r in self.list_ta_cmd(event):
+                await reply(r)
+            return
+        elif clean_text.startswith("添加助教 ") or clean_text.startswith("加助教 "):
+            event.stop_event()
+            p = clean_text.split(maxsplit=1)[1]
+            async for r in self.add_ta_cmd(event, p):
+                await reply(r)
+            return
+        elif clean_text.startswith("移除助教 ") or clean_text.startswith("删助教 "):
+            event.stop_event()
+            p = clean_text.split(maxsplit=1)[1]
+            async for r in self.remove_ta_cmd(event, p):
+                await reply(r)
+            return
+        elif clean_text in ["绑定列表", "已绑定学生"]:
+            event.stop_event()
+            async for r in self.list_bindings_cmd(event):
+                await reply(r)
+            return
+        elif clean_text in ["设为班级群", "设置班群", "绑定班群"]:
+            event.stop_event()
+            async for r in self.set_class_group_cmd(event):
+                await reply(r)
+            return
+        elif clean_text in ["班级群列表", "通告群列表"]:
+            event.stop_event()
+            async for r in self.list_class_groups_cmd(event):
                 await reply(r)
             return
         elif clean_text.startswith("绑定 ") or clean_text.startswith("绑定:"):
