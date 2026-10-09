@@ -1,31 +1,104 @@
+# [Plugin]
 import asyncio
-from datetime import datetime, timedelta, timezone
-import json
 import os
 import re
+import sys
 import time
-import urllib.request
-import urllib.parse
-import aiohttp
+
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import register, Star
 from astrbot.api.provider import ProviderRequest
-from astrbot.api.message_components import File, At, Plain
+from astrbot.api.message_components import File
 
-API_BASE = "https://gmail.bdot.in"
-SUPER_ADMIN_QQ = "1689491386"  # 固定超级管理员 Owner
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
 
-# 交互会话缓存：(sender_id, group_id) -> {"time": float, "type": str, ...}
+try:
+    from .config import (
+        API_BASE,
+        SUPER_ADMIN_QQ,
+        get_class_groups,
+        add_class_group,
+        remove_class_group,
+        get_teaching_assistants,
+        add_teaching_assistant,
+        remove_teaching_assistant,
+        is_super_admin,
+        is_ta_or_admin,
+        is_admin,
+    )
+    from .client import (
+        api_get,
+        async_api_get,
+        async_api_post_json,
+        async_api_delete,
+        async_upload_file,
+        get_assignments,
+        match_assignment,
+    )
+    from .formatters import (
+        format_file_size,
+        extract_student_id,
+        format_class_name,
+        format_beijing_time,
+        calculate_next_wednesday_deadline,
+        generate_notice_text,
+        render_status_card,
+        render_missing_list,
+        is_querying_my_submission,
+        build_student_status_card,
+        format_plagiarism_type,
+        render_plagiarism_alert,
+    )
+    from .actions import make_reply, upload_file_action
+except ImportError:
+    from config import (
+        API_BASE,
+        SUPER_ADMIN_QQ,
+        get_class_groups,
+        add_class_group,
+        remove_class_group,
+        get_teaching_assistants,
+        add_teaching_assistant,
+        remove_teaching_assistant,
+        is_super_admin,
+        is_ta_or_admin,
+        is_admin,
+    )
+    from client import (
+        api_get,
+        async_api_get,
+        async_api_post_json,
+        async_api_delete,
+        async_upload_file,
+        get_assignments,
+        match_assignment,
+    )
+    from formatters import (
+        format_file_size,
+        extract_student_id,
+        format_class_name,
+        format_beijing_time,
+        calculate_next_wednesday_deadline,
+        generate_notice_text,
+        render_status_card,
+        render_missing_list,
+        is_querying_my_submission,
+        build_student_status_card,
+        format_plagiarism_type,
+        render_plagiarism_alert,
+    )
+    from actions import make_reply, upload_file_action
+
+# [State]
 PENDING_SESSIONS = {}
-SESSION_TIMEOUT = 120  # 状态有效时间 120 秒
+SESSION_TIMEOUT = 120
 
-# 单用户提问时间戳滑动窗口：sender_id -> [timestamp, ...]
 USER_QUERY_TIMESTAMPS = {}
-MAX_USER_QUERIES_PER_MINUTE = 6  # 60 秒内最多 6 次提问
-USER_QUERY_COOLDOWN_SECONDS = 3.0  # 单次提问最小间隔 3 秒
-MAX_PROMPT_CHARS = 1500  # 单次提问最大字符数
-
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "plugin_config.json")
+MAX_USER_QUERIES_PER_MINUTE = 6
+USER_QUERY_COOLDOWN_SECONDS = 3.0
+MAX_PROMPT_CHARS = 1500
 
 HOMEWORK_SYSTEM_PROMPT = """你是《并行计算》课程作业助手。
 【核心职责】：
@@ -37,494 +110,14 @@ HOMEWORK_SYSTEM_PROMPT = """你是《并行计算》课程作业助手。
 - 语言风格：专业、简洁、直接、客观，严禁任何角色扮演、拟人化动作描写或冗余套话。
 - 若学生输入完全无关的话题，简明礼貌回复：“同学你好，本助手主要负责课程作业收集与查收指引，如需交作业请直接私聊发送作业压缩包。”"""
 
-def make_reply(event: AstrMessageEvent, text: str):
-    """
-    统一消息回复包装：
-    - 在群聊中自动在消息首部附加 @提问者 + 换行，确保群成员一目了然
-    - 在私聊中直接返回普通文本
-    """
-    sender_id = str(event.get_sender_id() or "")
-    if not event.is_private_chat() and sender_id:
-        clean_text = text.lstrip("\n")
-        return event.chain_result([At(qq=sender_id), Plain("\n" + clean_text)])
-    return event.plain_result(text)
-
-def load_config() -> dict:
-    default_cfg = {
-        "class_groups": [],
-        "teaching_assistants": [],
-    }
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    default_cfg.update(data)
-                    return default_cfg
-        except Exception:
-            pass
-    return default_cfg
-
-def save_config(cfg: dict):
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Failed to save config: {e}")
-
-def get_class_groups() -> list:
-    return load_config().get("class_groups", [])
-
-def add_class_group(group_id: str) -> bool:
-    cfg = load_config()
-    groups = cfg.get("class_groups", [])
-    if group_id not in groups:
-        groups.append(group_id)
-        cfg["class_groups"] = groups
-        save_config(cfg)
-        return True
-    return False
-
-def remove_class_group(group_id: str) -> bool:
-    cfg = load_config()
-    groups = cfg.get("class_groups", [])
-    if group_id in groups:
-        groups.remove(group_id)
-        cfg["class_groups"] = groups
-        save_config(cfg)
-        return True
-    return False
-
-def get_teaching_assistants() -> list:
-    return [str(q) for q in load_config().get("teaching_assistants", [])]
-
-def add_teaching_assistant(qq_id: str) -> bool:
-    qq = str(qq_id).strip()
-    if not qq.isdigit():
-        return False
-    cfg = load_config()
-    tas = [str(q) for q in cfg.get("teaching_assistants", [])]
-    if qq not in tas:
-        tas.append(qq)
-        cfg["teaching_assistants"] = tas
-        save_config(cfg)
-        return True
-    return False
-
-def remove_teaching_assistant(qq_id: str) -> bool:
-    qq = str(qq_id).strip()
-    cfg = load_config()
-    tas = [str(q) for q in cfg.get("teaching_assistants", [])]
-    if qq in tas:
-        tas.remove(qq)
-        cfg["teaching_assistants"] = tas
-        save_config(cfg)
-        return True
-    return False
-
-def is_super_admin(event: AstrMessageEvent) -> bool:
-    """是否为超级管理员（1689491386）"""
-    return str(event.get_sender_id() or "") == SUPER_ADMIN_QQ
-
-def is_ta_or_admin(event: AstrMessageEvent) -> bool:
-    """是否为助教或超级管理员（拥有查任意人、下载作业、查重权限）"""
-    sender_id = str(event.get_sender_id() or "")
-    if sender_id == SUPER_ADMIN_QQ:
-        return True
-    return sender_id in get_teaching_assistants()
-
-def is_admin(event: AstrMessageEvent) -> bool:
-    """兼容旧接口：代理到 is_ta_or_admin"""
-    return is_ta_or_admin(event)
-
-def api_get(endpoint: str):
-    url = f"{API_BASE}{endpoint}"
-    req = urllib.request.Request(url, headers={"User-Agent": "AstrBot"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-async def async_api_get(endpoint: str) -> dict:
-    url = f"{API_BASE}{endpoint}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=10) as resp:
-            return await resp.json()
-
-async def async_api_post_json(endpoint: str, data: dict) -> dict:
-    url = f"{API_BASE}{endpoint}"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=data, timeout=10) as resp:
-            return await resp.json()
-
-async def async_api_delete(endpoint: str) -> dict:
-    url = f"{API_BASE}{endpoint}"
-    async with aiohttp.ClientSession() as session:
-        async with session.delete(url, timeout=10) as resp:
-            return await resp.json()
-
-async def async_upload_file(assignment_id: str, file_path: str, orig_filename: str, student_id: str, student_name: str, class_name: str, qq_id: str) -> dict:
-    url = f"{API_BASE}/api/assignments/{assignment_id}/upload"
-    data = aiohttp.FormData()
-    data.add_field("file", open(file_path, "rb"), filename=orig_filename)
-    if student_id:
-        data.add_field("student_id", student_id)
-    if student_name:
-        data.add_field("student_name", student_name)
-    if class_name:
-        data.add_field("class_name", class_name)
-    if qq_id:
-        data.add_field("qq_id", qq_id)
-        data.add_field("uploader", f"qq:{qq_id}")
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, data=data, timeout=60) as resp:
-            return await resp.json()
-
-def get_assignments():
-    """动态获取全部已配置的作业列表"""
-    try:
-        return api_get("/api/assignments")
-    except Exception:
-        return []
-
-def match_assignment(query: str, assignments: list):
-    """根据用户输入的序号、ID 或关键词匹配作业"""
-    if not query or not assignments:
-        return None
-    query = query.strip()
-    
-    # 1. 数字序号匹配（1, 2, ...）
-    if query.isdigit():
-        idx = int(query)
-        if 1 <= idx <= len(assignments):
-            return assignments[idx - 1]
-
-    # 2. 精确匹配 id 或 name
-    for a in assignments:
-        if query == a.get("id") or query == a.get("name"):
-            return a
-
-    # 3. 模糊包含匹配（如 "实验1", "lab1", "并行计算"）
-    q_lower = query.lower()
-    for a in assignments:
-        if q_lower in a.get("id", "").lower() or q_lower in a.get("name", "").lower():
-            return a
-
-    return None
-
-def format_file_size(size_bytes: int) -> str:
-    """人性化格式化文件大小"""
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    elif size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} KB"
-    else:
-        return f"{size_bytes / (1024 * 1024):.2f} MB"
-
-def extract_student_id(text: str) -> str:
-    """从文本中提取 12 位纯数字学号（以 24 开头的 12 位学号为主，兼容 10~13 位）"""
-    m = re.search(r"\b(24\d{10})\b", text.strip())
-    if m:
-        return m.group(1)
-    m2 = re.search(r"\b(2\d{11})\b", text.strip())
-    if m2:
-        return m2.group(1)
-    m3 = re.search(r"(\d{12})", text.strip())
-    if m3:
-        return m3.group(1)
-    m4 = re.search(r"(\d{10,13})", text.strip())
-    if m4:
-        return m4.group(1)
-    return ""
-
-def format_class_name(raw: str, student_id: str = "") -> str:
-    """统一规范班级展示为 245班 或 24绿算"""
-    clean = (raw or "").strip()
-    if "绿" in clean or "算" in clean:
-        return "24绿算"
-    if "5" in clean or "五" in clean:
-        return "245班"
-    sid = (student_id or "").strip()
-    if sid.startswith("2408090105"):
-        return "245班"
-    if sid.startswith("2408090121") or sid == "240810010303":
-        return "24绿算"
-    return clean or "245班"
-
-BEIJING_TZ = timezone(timedelta(hours=8))
-
-def format_beijing_time(raw_time: str, with_seconds: bool = False) -> str:
-    """
-    统一将 UTC 时间或带时区时间格式化为中国北京时间（UTC+8）。
-    兼容 '2026-10-09T11:05:25Z'、'+08:00' 等 ISO 8601 标准格式。
-    """
-    if not raw_time:
-        return ""
-    raw = str(raw_time).strip()
-    try:
-        clean = raw.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(clean)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        bj_dt = dt.astimezone(BEIJING_TZ)
-        fmt = "%Y-%m-%d %H:%M:%S" if with_seconds else "%Y-%m-%d %H:%M"
-        return bj_dt.strftime(fmt)
-    except Exception:
-        return raw[:19 if with_seconds else 16].replace("T", " ")
-
-def calculate_next_wednesday_deadline() -> tuple:
-    """
-    推算下周三 18:00（基于北京时间）。
-    返回值: (friendly_str, iso_str)
-    """
-    now = datetime.now(BEIJING_TZ)
-    # weekday(): Monday is 0, Sunday is 6, Wednesday is 2.
-    days_ahead = (2 - now.weekday()) % 7
-    if days_ahead == 0:
-        days_ahead = 7
-    target_date = now + timedelta(days=days_ahead)
-    target_dt = target_date.replace(hour=18, minute=0, second=0, microsecond=0)
-    friendly = f"{target_dt.month}月{target_dt.day}日（下周三）18:00"
-    iso_str = target_dt.strftime("%Y-%m-%dT18:00:00+08:00")
-    return friendly, iso_str
-
-def generate_notice_text(lab_num: str, deadline_friendly: str) -> str:
-    """生成统一格式的作业提交要求文案"""
-    return (
-        f"并行计算实验{lab_num}作业提交要求\n\n"
-        f"截止时间：{deadline_friendly}\n\n"
-        "请将源码 + 实验报告整理后，以一个压缩包的形式提交：\n"
-        "1️⃣【推荐方式】直接私聊本机器人发送作业压缩包，自动秒级归档入库！\n"
-        "   （首次使用请在私聊发送：/绑定 学号 姓名）\n"
-        "2️⃣【备用方式】发送至我的邮箱：dotredstone0123@gmail.com\n\n"
-        "邮件主题（若走邮箱）：\n"
-        f"并行计算-实验{lab_num}-姓名\n"
-        f"示例：并行计算-实验{lab_num}-张三\n\n"
-        "压缩包命名：\n"
-        f"实验{lab_num}-班级-学号-姓名.zip\n"
-        f"示例：实验{lab_num}-245班-240809010501-张三.zip 或 实验{lab_num}-24绿算-240809012103-李四.zip\n\n"
-        "邮件正文（若走邮箱）：\n"
-        "姓名：张三\n"
-        "学号：240809010501\n"
-        "班级：245班\n"
-        f"提交内容：实验{lab_num}源码及实验报告\n\n"
-        "请严格按照以上格式提交，邮件主题、正文信息及附件命名不要自行修改格式，方便后续统一统计和整理。"
-    )
-
-def render_status_card(data: dict) -> str:
-    """生成单次作业统计详情卡片（规范学术语言）"""
-    deadline = format_beijing_time(data.get("deadline", ""))
-    return (
-        f"📊【{data['assignment_name']}】作业提交统计\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"✅ 已提交人数：{data['submitted_count']} / {data['total_expected']} 人\n"
-        f"📈 提交比例：{data['submission_rate']}\n"
-        f"⚠️ 迟交人数：{data['late_count']} 人\n"
-        f"⏳ 截止时间：{deadline}"
-    )
-
-def render_missing_list(data: dict) -> str:
-    """生成单次作业未交学生名单（规范通告语言）"""
-    missing = data.get("missing_list") or []
-    
-    if not missing:
-        return f"🎉【{data['assignment_name']}】全员均已按时提交完成！"
-
-    lines = [f"📢【{data['assignment_name']}】未交作业学生名单（共 {len(missing)} 人）：", "━━━━━━━━━━━━━━━"]
-    for idx, s in enumerate(missing, 1):
-        cl = format_class_name(s.get("class_name", ""), s.get("student_id", ""))
-        lines.append(f"{idx}. {s['name']}（{s['student_id']}，{cl}）")
-    lines.append("━━━━━━━━━━━━━━━\n💡 提醒：请以上同学抓紧整理源码与实验报告，直接私聊机器人发送作业压缩包即可自动归档提交。")
-    return "\n".join(lines)
-
-def is_querying_my_submission(text: str) -> bool:
-    """判断自然语言文本是否在询问个人作业提交状态（如：看看我交了吗、我交了没、查收等）"""
-    clean = re.sub(r"[？?！!，,。.\s~～@]+", "", text.strip())
-    if clean in ["查作业", "作业统计", "未交", "未交名单", "谁没交"]:
-        return False
-    patterns = [
-        r"交.*[了吗没]",
-        r"交没交",
-        r"看看我",
-        r"查查我",
-        r"查一下我",
-        r"帮我查",
-        r"查我",
-        r"我的作业",
-        r"作业.*[吗没]",
-        r"收到了[吗没]?",
-        r"收到没",
-        r"^查收",
-        r"^看看$",
-    ]
-    for pat in patterns:
-        if re.search(pat, clean):
-            return True
-    return False
-
-async def build_student_status_card(student_id: str, student_name: str, class_name: str) -> str:
-    """生成学生个人作业查收/提交状态汇总卡片"""
-    try:
-        assignments_resp = await async_api_get("/api/assignments")
-        if isinstance(assignments_resp, list):
-            assignments = assignments_resp
-        elif isinstance(assignments_resp, dict):
-            assignments = assignments_resp.get("assignments", [])
-        else:
-            assignments = []
-    except Exception:
-        assignments = []
-
-    if not assignments:
-        return "❌ 获取作业列表失败或当前未发布任何作业。"
-
-    results = []
-    for a in assignments:
-        aid = a["id"]
-        a_name = a["name"]
-        dl = format_beijing_time(a.get("deadline", ""))
-        try:
-            sub_data = await async_api_get(f"/api/assignments/{aid}/submissions")
-            matched_subs = [
-                s for s in sub_data.get("submissions", [])
-                if s.get("student_id") == student_id or s.get("student_name") == student_name
-            ]
-        except Exception:
-            matched_subs = []
-
-        if matched_subs:
-            s = matched_subs[0]
-            size_str = format_file_size(s.get("file_size", 0))
-            sub_time = format_beijing_time(s.get("submitted_at", ""))
-            late_tag = " ⚠️【迟交】" if s.get("is_late") else ""
-            results.append(
-                f"🔹【{a_name}】：\n"
-                f"    ✅ 已成功提交归档{late_tag}\n"
-                f"    📁 附件：{s.get('target_filename')}\n"
-                f"    📦 大小：{size_str} | 🕒 提交时间：{sub_time}"
-            )
-        else:
-            try:
-                mis_data = await async_api_get(f"/api/assignments/{aid}/missing")
-                is_missing = any(
-                    m.get("student_id") == student_id or m.get("name") == student_name
-                    for m in (mis_data.get("missing_list") or [])
-                )
-            except Exception:
-                is_missing = False
-
-            if is_missing:
-                results.append(
-                    f"🔹【{a_name}】：\n"
-                    f"    ⚠️ 暂未查询到提交记录\n"
-                    f"    ⏳ 截止时间：{dl}"
-                )
-            else:
-                results.append(
-                    f"🔹【{a_name}】：\n"
-                    f"    ❓ 未在该次作业花名册中找到该学生"
-                )
-
-    c_show = format_class_name(class_name, student_id)
-    msg = (
-        f"👋【{student_name}】同学（{c_show}）你好！为你查到作业提交状态：\n"
-        "━━━━━━━━━━━━━━━\n"
-        + "\n".join(results)
-        + "\n━━━━━━━━━━━━━━━\n"
-        "💡 如需提交或更新作业，直接在私聊把新的压缩包发给我即可秒级自动入库！"
-    )
-    return msg
-
-def format_plagiarism_type(dup_type_raw: str) -> tuple:
-    """返回 (判定类型标签, 详细防抄袭说明)"""
-    if dup_type_raw == "exact_archive":
-        return (
-            "整包直接复制（压缩包完全一致）",
-            "检测到你的压缩包文件哈希与已提交同学完全一致。严禁直接复制压缩包提交！请独立完成实验后再行提交。"
-        )
-    elif dup_type_raw == "exact_code":
-        return (
-            "源码完全一致（原代码未做修改）",
-            "检测到你的核心源代码文件与已提交同学完全一致。严禁仅修改文件名或实验报告互相抄袭！请独立编写代码后再行提交。"
-        )
-    elif dup_type_raw == "normalized_code":
-        return (
-            "换壳抄袭（仅修改注释姓名或排版格式）",
-            "检测到你的代码逻辑与已提交同学完全一致（仅修改了注释姓名或排版缩进）。系统已自动穿透注释层比对，请独立完成实验！"
-        )
-    elif dup_type_raw == "structural_code":
-        return (
-            "换壳抄袭（核心算法结构100%雷同，仅替换变量名/函数名）",
-            "检测到你的代码语法结构与算法逻辑与已提交同学 100% 雷同（仅重命名了变量名或函数名）。代码抽象语法树校验未通过，请独立完成实验！"
-        )
-    return (
-        "换壳抄袭（核心源码高度雷同）",
-        "检测到你的核心代码与已提交同学高度雷同。严禁抄袭他人代码，请独立完成实验！"
-    )
-
-def render_plagiarism_alert(upload_res: dict) -> str:
-    """生成学术诚信查重拦截警报卡片（规范通告）"""
-    dup = upload_res.get("duplicate") or {}
-    dup_type_raw = dup.get("duplicate_type", "")
-    dup_type, desc_str = format_plagiarism_type(dup_type_raw)
-    files = dup.get("identical_files") or []
-    files_str = "、".join(files) if files else "全部代码文件"
-    matched_name = dup.get("matched_student_name", "其他同学")
-    matched_sid = dup.get("matched_student_id", "")
-    masked_sid = (matched_sid[:4] + "****" + matched_sid[-2:]) if len(matched_sid) > 6 else matched_sid
-
-    return (
-        "⚠️【学术诚信拦截警报】\n"
-        "━━━━━━━━━━━━━━━\n"
-        "❌ 作业归档被拒绝：代码查重与指纹校验未通过！\n"
-        f"🔍 判定类型：{dup_type}\n"
-        f"📌 碰撞源码：[{files_str}]\n"
-        f"👥 相同来源：同学【{matched_name}】({masked_sid})\n"
-        "━━━━━━━━━━━━━━━\n"
-        f"💡 说明：{desc_str}"
-    )
-
-async def upload_file_action(event: AstrMessageEvent, download_url: str, filename: str, display_name: str):
-    """通用文件直传操作"""
-    bot = getattr(event, "bot", None)
-    if not bot:
-        yield make_reply(event, "❌ 内部错误：未能获取底层协议客户端。")
-        return
-
-    group_id = event.get_group_id()
-    sender_id = event.get_sender_id()
-    target_desc = f"群 {group_id} 的群文件" if group_id else "私聊会话"
-
-    yield make_reply(event, f"⏳ 正在打包【{display_name}】并上传至{target_desc}，请稍候...")
-
-    try:
-        if group_id:
-            await bot.call_action(
-                "upload_group_file",
-                group_id=str(group_id),
-                file=download_url,
-                name=filename,
-            )
-            yield make_reply(event, f"✅ 作业归档【{filename}】已成功上传至本群群文件！可前往群文件下载。")
-        else:
-            await bot.call_action(
-                "upload_private_file",
-                user_id=str(sender_id),
-                file=download_url,
-                name=filename,
-            )
-            yield make_reply(event, f"✅ 作业归档【{filename}】已作为私聊文件发送给你！")
-    except Exception as e:
-        yield make_reply(event, f"❌ 上传文件失败: {e}\n💡 备用下载直链：{download_url}")
-
-@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.4.2")
+@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.4.3")
 class HomeworkPlugin(Star):
     def __init__(self, context):
         super().__init__(context)
 
+    # [Guardrails]
     @filter.on_llm_request()
     async def handle_llm_guardrails(self, event: AstrMessageEvent, req: ProviderRequest):
-        """大模型调用拦截、群聊防滥用门禁与私聊防刷保护"""
-        # 1. 群聊防滥用：拦截非管理员在群聊中触发大模型闲聊/提问，节省 token 并避免刷屏
         if not event.is_private_chat() and not is_admin(event):
             event.stop_event()
             await event.send(make_reply(event,
@@ -533,19 +126,16 @@ class HomeworkPlugin(Star):
             ))
             return
 
-        # 2. 私聊防滥用、首次身份握手与防刷保护（管理员豁免）
         if event.is_private_chat() and not is_admin(event):
             msg_text = event.get_message_str().strip()
             sender_id = str(event.get_sender_id())
 
-            # 检查是否已建立身份连接（绑定学号）
             try:
                 bind_data = await async_api_get(f"/api/bindings/{sender_id}")
             except Exception:
                 bind_data = {}
 
             if bind_data.get("error"):
-                # 如果输入中直接包含 10~13 位学号，尝试自动绑定
                 sid = extract_student_id(msg_text)
                 if sid:
                     try:
@@ -556,7 +146,6 @@ class HomeworkPlugin(Star):
                         pass
 
             if bind_data.get("error") and not msg_text.startswith("/") and not msg_text.startswith("!"):
-                # 仍未绑定，拦截本次大模型请求并友好引导建立连接
                 event.stop_event()
                 session_key = (sender_id, "")
                 PENDING_SESSIONS[session_key] = {
@@ -569,8 +158,7 @@ class HomeworkPlugin(Star):
                     "首次使用请直接回复你的【学号】（例如：240809010501）完成身份绑定，绑定后可直接私聊发送作业压缩包秒级归档提交。"
                 ))
                 return
-            
-            # 单次提问字数上限保护
+
             if len(msg_text) > MAX_PROMPT_CHARS:
                 event.stop_event()
                 await event.send(make_reply(event,
@@ -579,13 +167,11 @@ class HomeworkPlugin(Star):
                 ))
                 return
 
-            # 滑动窗口频率限制
             sender_id = str(event.get_sender_id())
             now = time.time()
             history = USER_QUERY_TIMESTAMPS.get(sender_id, [])
             history = [t for t in history if now - t < 60]
 
-            # 最小冷却间隔
             if history and (now - history[-1] < USER_QUERY_COOLDOWN_SECONDS):
                 event.stop_event()
                 await event.send(make_reply(event,
@@ -593,7 +179,6 @@ class HomeworkPlugin(Star):
                 ))
                 return
 
-            # 60 秒上限
             if len(history) >= MAX_USER_QUERIES_PER_MINUTE:
                 event.stop_event()
                 await event.send(make_reply(event,
@@ -604,7 +189,6 @@ class HomeworkPlugin(Star):
             history.append(now)
             USER_QUERY_TIMESTAMPS[sender_id] = history
 
-        # 3. 动态注入专属助教人设、当前学生身份与安全防御守则
         student_ctx = ""
         if event.is_private_chat():
             try:
@@ -620,6 +204,7 @@ class HomeworkPlugin(Star):
         full_prompt = HOMEWORK_SYSTEM_PROMPT + student_ctx
         req.system_prompt = full_prompt
 
+    # [LLM Tools]
     @filter.llm_tool(name="query_student_homework")
     async def tool_query_student(self, event: AstrMessageEvent, student_name_or_id: str) -> str:
         '''查询指定学生在各次作业中的提交与归档状态。
@@ -695,9 +280,9 @@ class HomeworkPlugin(Star):
             lines.append(f"{idx}. {a['name']} (ID: {a['id']})，截止时间：{dl}，应交人数：{a.get('total_expected', 0)} 人")
         return "\n".join(lines)
 
+    # [Help]
     @filter.command("帮助", alias={"作业帮助"})
     async def help_cmd(self, event: AstrMessageEvent):
-        """显示作业助手指令菜单"""
         msg = (
             "📖【并行计算课程 · 作业助手指南】\n"
             "━━━━━━━━━━━━━━━\n"
@@ -722,10 +307,9 @@ class HomeworkPlugin(Star):
         )
         yield make_reply(event, msg)
 
-    # ---------------- 身份绑定模块 ----------------
+    # [Binding Commands]
     @filter.command("绑定")
     async def bind_student(self, event: AstrMessageEvent, param: str = ""):
-        """绑定 QQ 与学生学号姓名：/绑定 <学号> [姓名]"""
         sender_id = str(event.get_sender_id())
         parts = param.strip().split()
         if not parts:
@@ -769,7 +353,6 @@ class HomeworkPlugin(Star):
 
     @filter.command("我的信息", alias={"查询绑定", "我的绑定"})
     async def my_info(self, event: AstrMessageEvent):
-        """查看当前绑定的学生信息"""
         sender_id = str(event.get_sender_id())
         try:
             resp = await async_api_get(f"/api/bindings/{sender_id}")
@@ -798,7 +381,6 @@ class HomeworkPlugin(Star):
 
     @filter.command("解绑")
     async def unbind_student(self, event: AstrMessageEvent, target_qq: str = ""):
-        """解除身份绑定：/解绑 或 管理员 /解绑 <QQ号>"""
         sender_id = str(event.get_sender_id())
         to_unbind = sender_id
 
@@ -821,7 +403,6 @@ class HomeworkPlugin(Star):
 
     @filter.command("绑定列表")
     async def list_bindings_cmd(self, event: AstrMessageEvent):
-        """管理员查看所有已绑定的学生名单"""
         if not is_admin(event):
             yield make_reply(event, "❌ 权限不足：此指令仅限助教或管理员使用。")
             return
@@ -843,10 +424,9 @@ class HomeworkPlugin(Star):
             lines.append(f"{idx}. {b.get('student_name')}（{b.get('student_id')}，{cl}）- QQ:{b.get('qq_id')}")
         yield make_reply(event, "\n".join(lines))
 
-    # ---------------- 班级群配置模块 ----------------
+    # [Class Group Commands]
     @filter.command("设为班级群")
     async def set_class_group_cmd(self, event: AstrMessageEvent):
-        """将当前群设置为作业通知群（群聊中由管理员执行）"""
         if not is_admin(event):
             yield make_reply(event, "❌ 权限不足：仅助教或管理员可配置班级群。")
             return
@@ -863,7 +443,6 @@ class HomeworkPlugin(Star):
 
     @filter.command("移除班级群")
     async def remove_class_group_cmd(self, event: AstrMessageEvent):
-        """移除当前班级群"""
         if not is_admin(event):
             yield make_reply(event, "❌ 权限不足。")
             return
@@ -880,7 +459,6 @@ class HomeworkPlugin(Star):
 
     @filter.command("班级群列表")
     async def list_class_groups_cmd(self, event: AstrMessageEvent):
-        """查看已配置的班级群列表"""
         if not is_admin(event):
             yield make_reply(event, "❌ 权限不足。")
             return
@@ -892,10 +470,9 @@ class HomeworkPlugin(Star):
 
         yield make_reply(event, "📢 当前已配置的并行计算通告群：\n" + "\n".join([f"• 群号：{g}" for g in groups]))
 
-    # ---------------- 助教团队与权限管理 ----------------
+    # [TA Management Commands]
     @filter.command("添加助教")
     async def add_ta_cmd(self, event: AstrMessageEvent, qq: str = ""):
-        """【管理员专属】添加助教：/添加助教 <QQ号>"""
         if not is_super_admin(event):
             yield make_reply(event, "❌ 权限不足：仅超级管理员可任命助教。")
             return
@@ -922,7 +499,6 @@ class HomeworkPlugin(Star):
 
     @filter.command("移除助教")
     async def remove_ta_cmd(self, event: AstrMessageEvent, qq: str = ""):
-        """【管理员专属】移除助教：/移除助教 <QQ号>"""
         if not is_super_admin(event):
             yield make_reply(event, "❌ 权限不足：仅超级管理员可移除助教。")
             return
@@ -937,7 +513,6 @@ class HomeworkPlugin(Star):
 
     @filter.command("助教列表")
     async def list_ta_cmd(self, event: AstrMessageEvent):
-        """查看当前配置的助教团队列表"""
         if not is_ta_or_admin(event):
             yield make_reply(event, "❌ 权限不足：仅助教或管理员可查看助教名单。")
             return
@@ -963,10 +538,9 @@ class HomeworkPlugin(Star):
         lines.append("━━━━━━━━━━━━━━━")
         yield make_reply(event, "\n".join(lines))
 
-    # ---------------- 作业查询与统计 ----------------
+    # [Status & Missing Commands]
     @filter.command("查作业")
     async def status_cmd(self, event: AstrMessageEvent, param: str = ""):
-        """查询作业提交总体进度：/查作业 或 /查作业 2"""
         assignments = get_assignments()
         if not assignments:
             yield make_reply(event, "❌ 获取作业列表失败或当前未配置任何作业。")
@@ -974,7 +548,6 @@ class HomeworkPlugin(Star):
 
         param = param.strip()
 
-        # 模式 1：用户指定了具体作业
         if param:
             target = match_assignment(param, assignments)
             if not target:
@@ -988,7 +561,6 @@ class HomeworkPlugin(Star):
                 yield make_reply(event, f"❌ 查询作业状态失败: {e}")
             return
 
-        # 模式 2：未指定作业
         if len(assignments) == 1:
             try:
                 data = api_get(f"/api/assignments/{assignments[0]['id']}/status")
@@ -1023,7 +595,6 @@ class HomeworkPlugin(Star):
 
     @filter.command("未交")
     async def missing_cmd(self, event: AstrMessageEvent, param: str = ""):
-        """查询未交学生名单：/未交 或 /未交 2"""
         assignments = get_assignments()
         if not assignments:
             yield make_reply(event, "❌ 获取作业列表失败或当前未配置任何作业。")
@@ -1072,12 +643,10 @@ class HomeworkPlugin(Star):
 
     @filter.command("查收")
     async def check_student(self, event: AstrMessageEvent, query: str = ""):
-        """自助查询个人作业是否收到：/查收 张三 或 /查收 24080901xxxx [序号]"""
         query = query.strip()
         sender_id = str(event.get_sender_id())
         is_ta = is_ta_or_admin(event)
 
-        # 获取当前发送者绑定信息
         try:
             bind_info = await async_api_get(f"/api/bindings/{sender_id}")
         except Exception:
@@ -1134,7 +703,6 @@ class HomeworkPlugin(Star):
                     student_query = p0
                     target_assignment = match_assignment(p1, assignments)
 
-            # 核心权限鉴权：非助教/管理员严禁查询他人作业
             if not is_ta:
                 if not has_binding:
                     yield make_reply(event, 
@@ -1213,10 +781,9 @@ class HomeworkPlugin(Star):
             msg += "\n━━━━━━━━━━━━━━━\n💡 提示：如需提交或更新作业，可直接私聊机器人发送压缩包。"
         yield make_reply(event, msg)
 
-    # ---------------- 导出作业模块 ----------------
+    # [Export Commands]
     @filter.command("导出作业", alias={"下载作业"})
     async def export_cmd(self, event: AstrMessageEvent, param: str = ""):
-        """管理员导出作业归档"""
         if not is_admin(event):
             yield make_reply(event, "❌ 权限不足：作业归档导出仅限课程助教或管理员执行。")
             return
@@ -1274,7 +841,6 @@ class HomeworkPlugin(Star):
 
     @filter.command("导出整学期", alias={"导出全部作业"})
     async def export_all_direct_cmd(self, event: AstrMessageEvent):
-        """管理员一键导出整学期全量作业归档压缩包"""
         if not is_admin(event):
             yield make_reply(event, "❌ 权限不足：整学期归档导出仅限课程助教或管理员执行。")
             return
@@ -1284,10 +850,9 @@ class HomeworkPlugin(Star):
         async for res in upload_file_action(event, url, filename, "整学期全量作业"):
             yield res
 
-    # ---------------- 代码查重模块 ----------------
+    # [Plagiarism Commands]
     @filter.command("查重", alias={"代码查重", "学术诚信", "一键查重", "查抄袭"})
     async def plagiarism_cmd(self, event: AstrMessageEvent, param: str = ""):
-        """助教与管理员查看作业哈希查重报告：/查重 或 /查重 2"""
         if not is_ta_or_admin(event):
             yield make_reply(event, "❌ 权限不足：代码查重仅限课程助教或管理员执行。")
             return
@@ -1299,7 +864,6 @@ class HomeworkPlugin(Star):
 
         param = param.strip()
 
-        # 模式 1：指定了具体某次作业（如 /查重 1 或 /查重 实验2）
         if param and param not in ["全部", "all"]:
             target = match_assignment(param, assignments)
             if not target:
@@ -1341,7 +905,6 @@ class HomeworkPlugin(Star):
             yield make_reply(event, "\n".join(lines))
             return
 
-        # 模式 2：未指定作业（一键全员全作业查重）
         total_suspect_pairs = 0
         summary_lines = [
             "🔍【并行计算课程 · 全员代码哈希查重报告】",
@@ -1380,10 +943,9 @@ class HomeworkPlugin(Star):
         summary_lines.append("💡 提示：如需单独查看某次作业详情，可发送：/查重 1")
         yield make_reply(event, "\n".join(summary_lines))
 
-    # ---------------- 消息与文件事件监听 ----------------
+    # [Message Listener]
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL, priority=1)
     async def on_message_listener(self, event: AstrMessageEvent):
-        """核心监听：多轮会话回复处理、私聊直收作业文件处理、助教发实验卡自动下发处理"""
         sender_id = str(event.get_sender_id())
         group_id = str(event.get_group_id() or "")
         session_key = (sender_id, group_id)
@@ -1395,7 +957,6 @@ class HomeworkPlugin(Star):
             else:
                 await event.send(msg)
 
-        # 1. 检查是否有文件消息段
         file_comp = None
         if hasattr(event.message_obj, "message") and isinstance(event.message_obj.message, list):
             for comp in event.message_obj.message:
@@ -1403,12 +964,10 @@ class HomeworkPlugin(Star):
                     file_comp = comp
                     break
 
-        # 2. 如果私聊收到文件
         if is_private and file_comp:
             event.stop_event()
             raw_filename = file_comp.name or "homework.zip"
 
-            # 2.1 检查是否为助教发送实验卡
             lab_match = re.search(r"(?:实验卡|实验|lab)\s*(\d+)", raw_filename, re.I)
             is_doc_ext = any(raw_filename.lower().endswith(ext) for ext in [".pdf", ".docx", ".doc"])
             if is_admin(event) and lab_match and is_doc_ext:
@@ -1416,7 +975,6 @@ class HomeworkPlugin(Star):
                 friendly_dl, iso_dl = calculate_next_wednesday_deadline()
                 notice_text = generate_notice_text(lab_num, friendly_dl)
 
-                # 下载实验卡文件备用
                 local_file = await file_comp.get_file()
 
                 PENDING_SESSIONS[session_key] = {
@@ -1446,8 +1004,6 @@ class HomeworkPlugin(Star):
                 await reply(preview_msg)
                 return
 
-            # 2.2 学生私聊提交作业文件
-            # 校验是否为合法作业压缩包/文档
             valid_hw_exts = [".zip", ".rar", ".7z", ".tar.gz", ".tgz", ".tar", ".pdf"]
             if not any(raw_filename.lower().endswith(ext) for ext in valid_hw_exts):
                 await reply(
@@ -1456,7 +1012,6 @@ class HomeworkPlugin(Star):
                 )
                 return
 
-            # 查询绑定信息
             try:
                 bind_data = await async_api_get(f"/api/bindings/{sender_id}")
             except Exception as e:
@@ -1496,7 +1051,6 @@ class HomeworkPlugin(Star):
                     await reply("❌ 接收文件失败：未能下载文件流。请稍后重试。")
                     return
 
-                # 上传至后端（自动匹配最新开放作业）
                 upload_res = await async_upload_file(
                     assignment_id="latest",
                     file_path=local_path,
@@ -1507,7 +1061,6 @@ class HomeworkPlugin(Star):
                     qq_id=sender_id,
                 )
 
-                # 清理临时下载文件
                 try:
                     if os.path.exists(local_path):
                         os.remove(local_path)
@@ -1551,7 +1104,6 @@ class HomeworkPlugin(Star):
                 await reply(f"❌ 处理作业提交异常: {e}")
                 return
 
-        # 3. 处理交互会话多轮回复
         session_info = PENDING_SESSIONS.get(session_key)
         if not session_info:
             return
@@ -1562,7 +1114,6 @@ class HomeworkPlugin(Star):
 
         text = event.message_str.strip()
 
-        # 取消会话
         if text.lower() in ["取消", "退出", "q", "quit", "cancel"]:
             fpath = session_info.get("file_path")
             if fpath and os.path.exists(fpath):
@@ -1575,14 +1126,12 @@ class HomeworkPlugin(Star):
             event.stop_event()
             return
 
-        # 若是常规以 / 开头的指令，退出会话放行
         if text.startswith("/") or text.startswith("!"):
             del PENDING_SESSIONS[session_key]
             return
 
         s_type = session_info.get("type")
 
-        # 3.1 助教发布新实验确认
         if s_type == "publish_lab":
             lab_num = session_info.get("lab_num")
             if text in ["发布", f"发布 {lab_num}", "确认发布", "确认", "yes", "y"]:
@@ -1591,7 +1140,6 @@ class HomeworkPlugin(Star):
 
                 await reply(f"⏳ 正在为【并行计算实验{lab_num}】注册云端规则并广播通知...")
 
-                # 1. 云端注册新作业规则
                 rule_cfg = {
                     "id": f"parallel_computing_lab{lab_num}",
                     "name": f"并行计算实验{lab_num}",
@@ -1612,7 +1160,6 @@ class HomeworkPlugin(Star):
                     await reply(f"❌ 调用作业注册接口异常: {e}")
                     return
 
-                # 2. 分发至班级群
                 bot = getattr(event, "bot", None)
                 class_groups = get_class_groups()
                 notice_text = session_info["notice_text"]
@@ -1623,9 +1170,7 @@ class HomeworkPlugin(Star):
                 if bot and class_groups:
                     for g_id in class_groups:
                         try:
-                            # 发送群通知文案
                             await bot.call_action("send_group_msg", group_id=int(g_id), message=notice_text)
-                            # 上传实验卡文件至群文件
                             if file_path and os.path.exists(file_path):
                                 await bot.call_action("upload_group_file", group_id=str(g_id), file=file_path, name=filename)
                             success_groups.append(g_id)
@@ -1646,7 +1191,6 @@ class HomeworkPlugin(Star):
                 )
                 return
 
-        # 3.2 首次发文件后回复学号绑定并自动归档作业
         if s_type == "bind_and_submit":
             sid = extract_student_id(text)
             if not sid:
@@ -1659,7 +1203,6 @@ class HomeworkPlugin(Star):
 
             await reply(f"⏳ 正在核对学号【{sid}】并绑定归档作业...")
 
-            # 1. 尝试绑定
             bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
             if not bind_res.get("success"):
                 err = bind_res.get("error", "学号核验失败")
@@ -1678,7 +1221,6 @@ class HomeworkPlugin(Star):
             fpath = session_info.get("file_path")
             fname = session_info.get("filename")
 
-            # 2. 提交暂存的作业文件
             try:
                 upload_res = await async_upload_file(
                     assignment_id="latest",
@@ -1736,7 +1278,6 @@ class HomeworkPlugin(Star):
             await reply(combined_card)
             return
 
-        # 3.3 首次提问被拦截后回复学号建立连接
         if s_type == "bind_and_chat":
             sid = extract_student_id(text)
             if not sid:
@@ -1768,7 +1309,6 @@ class HomeworkPlugin(Star):
             )
             return
 
-        # 3.4 首次询问“看看我交了吗”后回复学号绑定并自动播报作业状态
         if s_type == "bind_and_report_status":
             sid = extract_student_id(text)
             if not sid:
@@ -1798,7 +1338,6 @@ class HomeworkPlugin(Star):
             )
             return
 
-        # 3.5 导出 / 查作业 / 未交 多轮选择
         options = session_info.get("options", {})
         if text in options:
             del PENDING_SESSIONS[session_key]
@@ -1834,7 +1373,6 @@ class HomeworkPlugin(Star):
             event.stop_event()
             return
 
-        # 4. 免「/」常规快捷口令处理
         clean_text = text.strip()
         if clean_text in ["查作业", "作业统计", "作业概览", "查看作业", "作业进度", "全部作业"]:
             event.stop_event()
@@ -1905,7 +1443,6 @@ class HomeworkPlugin(Star):
                 await reply(r)
             return
 
-        # 5. 自然语言口语化查询：“看看我交了吗？” / “我交了吗” / “交了没” / “查收”
         if is_querying_my_submission(clean_text):
             event.stop_event()
 
@@ -1916,7 +1453,6 @@ class HomeworkPlugin(Star):
                 bind_data = {}
 
             if not bind_data.get("error"):
-                # 机器人认识该同学（已绑定）
                 target_sid = explicit_sid if explicit_sid else bind_data.get("student_id", "")
                 target_name = bind_data.get("student_name", "") if not explicit_sid else ""
                 target_class = format_class_name(bind_data.get("class_name", ""), target_sid)
@@ -1924,9 +1460,7 @@ class HomeworkPlugin(Star):
                 await reply(card)
                 return
             else:
-                # 机器人还不认识该同学（未绑定）
                 if explicit_sid:
-                    # 提问中正好带了学号，直接尝试绑定并查询
                     bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": explicit_sid})
                     if bind_res.get("success"):
                         b = bind_res.get("binding", {})
@@ -1952,7 +1486,6 @@ class HomeworkPlugin(Star):
                     )
                     return
 
-        # 6. 私聊直接发送纯学号快速建立连接并播报作业状态
         if is_private and not text.startswith("/") and not text.startswith("!"):
             sid = extract_student_id(text)
             clean_digits = text.replace(" ", "").replace("学号", "").replace("：", "").replace(":", "")
@@ -1984,4 +1517,3 @@ class HomeworkPlugin(Star):
                     else:
                         await reply(f"⚠️ 绑定失败：{bind_res.get('error')}")
                         return
-
