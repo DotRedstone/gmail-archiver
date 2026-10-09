@@ -419,6 +419,36 @@ target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
 	if int(rosterResp["total"].(float64)) != 2 {
 		t.Errorf("expected 2 students in roster, got %v", rosterResp["total"])
 	}
+
+	// 21. Test Anti-impersonation and Force Binding Overwrite
+	// 21.1 Attempt to bind already bound student 240809010501 to another QQ 999888 without force -> 409
+	bindDupBody := []byte(`{"qq_id":"999888","student_id":"240809010501","student_name":"支全振"}`)
+	reqDupBind := httptest.NewRequest("POST", "/api/bindings?token=secret-token-123", bytes.NewReader(bindDupBody))
+	reqDupBind.Header.Set("Content-Type", "application/json")
+	recDupBind := httptest.NewRecorder()
+	handler.ServeHTTP(recDupBind, reqDupBind)
+	if recDupBind.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for duplicate binding without force, got %d", recDupBind.Code)
+	}
+
+	// 21.2 Force overwrite by TA/Admin -> 200
+	bindForceBody := []byte(`{"qq_id":"999888","student_id":"240809010501","student_name":"支全振","force":true}`)
+	reqForceBind := httptest.NewRequest("POST", "/api/bindings?token=secret-token-123", bytes.NewReader(bindForceBody))
+	reqForceBind.Header.Set("Content-Type", "application/json")
+	recForceBind := httptest.NewRecorder()
+	handler.ServeHTTP(recForceBind, reqForceBind)
+	if recForceBind.Code != http.StatusOK {
+		t.Fatalf("expected 200 for force binding, got %d: %s", recForceBind.Code, recForceBind.Body.String())
+	}
+
+	// 21.3 Unbind by student_id
+	reqUnbind := httptest.NewRequest("DELETE", "/api/bindings/240809010501?token=secret-token-123", nil)
+	recUnbind := httptest.NewRecorder()
+	handler.ServeHTTP(recUnbind, reqUnbind)
+	if recUnbind.Code != http.StatusOK {
+		t.Fatalf("expected 200 for unbind by student_id, got %d: %s", recUnbind.Code, recUnbind.Body.String())
+	}
 }
+
 
 

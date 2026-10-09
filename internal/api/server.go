@@ -765,6 +765,7 @@ type createBindingRequest struct {
 	StudentID   string `json:"student_id"`
 	StudentName string `json:"student_name"`
 	ClassName   string `json:"class_name"`
+	Force       bool   `json:"force"`
 }
 
 func (s *Server) handleCreateBinding(w http.ResponseWriter, r *http.Request) {
@@ -823,12 +824,16 @@ func (s *Server) handleCreateBinding(w http.ResponseWriter, r *http.Request) {
 	// Anti-impersonation check: ensure student_id is not already bound by another QQ
 	if existing, err := s.database.GetStudentBindingByStudentID(req.StudentID); err == nil && existing != nil {
 		if existing.QQID != req.QQID {
-			masked := existing.QQID
-			if len(masked) > 4 {
-				masked = masked[:2] + "****" + masked[len(masked)-2:]
+			if !req.Force {
+				masked := existing.QQID
+				if len(masked) > 4 {
+					masked = masked[:2] + "****" + masked[len(masked)-2:]
+				}
+				writeJSONError(w, http.StatusConflict, fmt.Sprintf("该学号已被 QQ (%s) 绑定。若为你本人账号，请联系助教人工处理", masked))
+				return
 			}
-			writeJSONError(w, http.StatusConflict, fmt.Sprintf("该学号已被 QQ (%s) 绑定。若为你本人账号，请联系助教人工处理", masked))
-			return
+			// Force overwrite by TA/Admin: remove the old QQ binding first
+			_ = s.database.DeleteStudentBinding(existing.QQID)
 		}
 	}
 
@@ -851,8 +856,14 @@ func (s *Server) handleCreateBinding(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteBinding(w http.ResponseWriter, r *http.Request) {
-	qqID := chi.URLParam(r, "qq_id")
-	if err := s.database.DeleteStudentBinding(qqID); err != nil {
+	idParam := chi.URLParam(r, "qq_id")
+	err := s.database.DeleteStudentBinding(idParam)
+	if err != nil && errors.Is(err, db.ErrNotFound) {
+		if existing, err2 := s.database.GetStudentBindingByStudentID(idParam); err2 == nil && existing != nil {
+			err = s.database.DeleteStudentBinding(existing.QQID)
+		}
+	}
+	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeJSONError(w, http.StatusNotFound, "binding not found")
 			return

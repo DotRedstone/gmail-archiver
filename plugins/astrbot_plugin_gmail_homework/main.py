@@ -300,6 +300,8 @@ class HomeworkPlugin(Star):
             "6️⃣「我的信息」—— 查看当前绑定的学号、姓名与班级\n\n"
             "👑【助教/管理员专属】：\n"
             "• 查收 <姓名或学号> —— 直接查询指定同学作业（例：查收 支全振）\n"
+            "• 指定绑定 <QQ> <学号> [姓名] —— 直接为指定学生代绑身份\n"
+            "• 解绑 <QQ/学号/姓名> —— 解除指定学生的身份绑定（学生无权自主解绑）\n"
             "• 导出作业 / 导出整学期 —— 打包下载全员作业归档压缩包\n"
             "• 一键查重 / 查重 [序号] —— 全员代码哈希指纹查重，排查抄袭嫌疑\n"
             "• 私聊发实验卡文件 —— 自动提取实验号并一键分发群文件与广播\n"
@@ -314,26 +316,89 @@ class HomeworkPlugin(Star):
         yield make_reply(event, msg)
 
     # [Binding Commands]
+    @filter.command("指定绑定", alias={"代绑", "代绑定"})
+    async def assign_bind_student(self, event: AstrMessageEvent, param: str = ""):
+        """助教专属：直接指定任意 QQ 号与学生身份绑定"""
+        if not is_ta_or_admin(event):
+            yield make_reply(event, 
+                "❌ 权限不足：只有课程助教或管理员可为他人指定绑定。\n"
+                "💡 学生绑定请使用：/绑定 <学号> [姓名]"
+            )
+            return
+
+        parts = param.strip().split()
+        if len(parts) < 2:
+            yield make_reply(event,
+                "💡【助教指定绑定用法】\n"
+                "• /指定绑定 <目标QQ> <学号> [姓名]\n"
+                "例如：/指定绑定 1689491386 240809010501 支全振\n"
+                "（姓名可选填，系统会自动从花名册校验并补齐班级与姓名）"
+            )
+            return
+
+        target_qq = parts[0]
+        student_id = parts[1]
+        student_name = " ".join(parts[2:]) if len(parts) > 2 else ""
+
+        async for r in self._do_bind(event, target_qq=target_qq, student_id=student_id, student_name=student_name, is_assigned=True):
+            yield r
+
     @filter.command("绑定")
     async def bind_student(self, event: AstrMessageEvent, param: str = ""):
         sender_id = str(event.get_sender_id())
         parts = param.strip().split()
         if not parts:
-            yield make_reply(event, 
-                "💡 用法：/绑定 <学号> [姓名]\n"
-                "例如：/绑定 240809010501 支全振\n"
-                "（绑定身份后，直接私聊把作业压缩包发给机器人即可自动秒级入库！）"
-            )
+            if is_ta_or_admin(event):
+                yield make_reply(event, 
+                    "💡【绑定用法说明】\n"
+                    "• 本人绑定：/绑定 <学号> [姓名]\n"
+                    "• 助教代绑：/绑定 <目标QQ> <学号> [姓名]\n"
+                    "例如：/绑定 1689491386 240809010501 支全振"
+                )
+            else:
+                yield make_reply(event, 
+                    "💡 用法：/绑定 <学号> [姓名]\n"
+                    "例如：/绑定 240809010501 支全振\n"
+                    "（绑定身份后，直接私聊把作业压缩包发给机器人即可自动秒级入库！）"
+                )
             return
 
-        student_id = parts[0]
-        student_name = parts[1] if len(parts) > 1 else ""
+        target_qq = sender_id
+        is_assigned = False
 
+        if is_ta_or_admin(event):
+            # 智能判断助教是否在代绑：
+            # 情况1：3个及以上参数，首项为纯数字QQ号且第二项为纯数字学号
+            # 情况2：2个参数，首项为纯数字QQ号且第二项为纯数字学号（长度>=8）
+            if len(parts) >= 3 and parts[0].isdigit() and len(parts[0]) <= 11 and parts[1].isdigit():
+                target_qq = parts[0]
+                student_id = parts[1]
+                student_name = " ".join(parts[2:])
+                is_assigned = True
+            elif len(parts) == 2 and parts[0].isdigit() and len(parts[0]) <= 11 and parts[1].isdigit() and len(parts[1]) >= 8:
+                target_qq = parts[0]
+                student_id = parts[1]
+                student_name = ""
+                is_assigned = True
+            else:
+                student_id = parts[0]
+                student_name = parts[1] if len(parts) > 1 else ""
+        else:
+            # 普通学生：强制锁定为本人 QQ，禁止替他人指定
+            student_id = parts[0]
+            student_name = parts[1] if len(parts) > 1 else ""
+
+        async for r in self._do_bind(event, target_qq=target_qq, student_id=student_id, student_name=student_name, is_assigned=is_assigned):
+            yield r
+
+    async def _do_bind(self, event: AstrMessageEvent, target_qq: str, student_id: str, student_name: str, is_assigned: bool):
+        force = is_assigned or is_ta_or_admin(event)
         try:
             resp = await async_api_post_json("/api/bindings", {
-                "qq_id": sender_id,
+                "qq_id": target_qq,
                 "student_id": student_id,
                 "student_name": student_name,
+                "force": force,
             })
         except Exception as e:
             yield make_reply(event, f"❌ 请求服务端失败: {e}")
@@ -346,16 +411,30 @@ class HomeworkPlugin(Star):
 
         b = resp.get("binding", {})
         cl = format_class_name(b.get("class_name", ""), b.get("student_id", ""))
-        yield make_reply(event, 
-            "🎉【学生身份绑定成功】\n"
-            "━━━━━━━━━━━━━━━\n"
-            f"👤 姓名：{b.get('student_name')}\n"
-            f"🆔 学号：{b.get('student_id')}\n"
-            f"🏫 班级：{cl}\n"
-            f"📱 绑定 QQ：{sender_id}\n"
-            "━━━━━━━━━━━━━━━\n"
-            "💡 现在你可以直接【私聊把作业压缩包发给我】秒级自动入库，无需再发送邮件！"
-        )
+
+        if is_assigned:
+            yield make_reply(event, 
+                "🎉【助教指定身份绑定成功】\n"
+                "━━━━━━━━━━━━━━━\n"
+                f"👤 姓名：{b.get('student_name')}\n"
+                f"🆔 学号：{b.get('student_id')}\n"
+                f"🏫 班级：{cl}\n"
+                f"📱 绑定 QQ：{target_qq}\n"
+                "👮 操作人：课程助教/管理员\n"
+                "━━━━━━━━━━━━━━━\n"
+                "💡 目标同学现在可以直接【私聊把作业压缩包发给我】秒级自动入库！"
+            )
+        else:
+            yield make_reply(event, 
+                "🎉【学生身份绑定成功】\n"
+                "━━━━━━━━━━━━━━━\n"
+                f"👤 姓名：{b.get('student_name')}\n"
+                f"🆔 学号：{b.get('student_id')}\n"
+                f"🏫 班级：{cl}\n"
+                f"📱 绑定 QQ：{target_qq}\n"
+                "━━━━━━━━━━━━━━━\n"
+                "💡 现在你可以直接【私聊把作业压缩包发给我】秒级自动入库，无需再发送邮件！"
+            )
 
     @filter.command("我的信息", alias={"查询绑定", "我的绑定"})
     async def my_info(self, event: AstrMessageEvent):
@@ -386,26 +465,87 @@ class HomeworkPlugin(Star):
         )
 
     @filter.command("解绑")
-    async def unbind_student(self, event: AstrMessageEvent, target_qq: str = ""):
-        sender_id = str(event.get_sender_id())
-        to_unbind = sender_id
-
-        if target_qq.strip():
-            if not is_admin(event):
-                yield make_reply(event, "❌ 权限不足：只有管理员可指定解绑其他账号。")
-                return
-            to_unbind = target_qq.strip()
-
-        try:
-            resp = await async_api_delete(f"/api/bindings/{to_unbind}")
-        except Exception as e:
-            yield make_reply(event, f"❌ 解绑失败: {e}")
+    async def unbind_student(self, event: AstrMessageEvent, param: str = ""):
+        # 想解绑只能助教有权限解绑
+        if not is_ta_or_admin(event):
+            yield make_reply(event, 
+                "❌ 权限不足：为防止误解绑导致平时作业统计异常，学生账号解绑已锁定。\n"
+                "💡 如需修改或解除绑定，请联系课程助教或管理员处理。"
+            )
             return
 
-        if resp.get("success"):
-            yield make_reply(event, f"✅ 已解除 QQ [{to_unbind}] 的身份绑定。")
+        target = param.strip()
+        if not target:
+            yield make_reply(event,
+                "💡【助教解绑命令用法】\n"
+                "• /解绑 <QQ号>\n"
+                "• /解绑 <学号>\n"
+                "• /解绑 <姓名>\n"
+                "例如：/解绑 1689491386 或 /解绑 240809010501 或 /解绑 支全振"
+            )
+            return
+
+        try:
+            resp = await async_api_get("/api/bindings")
+            bindings = resp.get("bindings", [])
+        except Exception as e:
+            yield make_reply(event, f"❌ 获取绑定列表失败: {e}")
+            return
+
+        matched_list = []
+        for b in bindings:
+            qq = str(b.get("qq_id", "")).strip()
+            sid = str(b.get("student_id", "")).strip()
+            sname = str(b.get("student_name", "")).strip()
+            if target == qq or target == sid or target == sname:
+                matched_list.append(b)
+
+        if not matched_list:
+            for b in bindings:
+                sname = str(b.get("student_name", "")).strip()
+                if len(target) >= 2 and target in sname:
+                    matched_list.append(b)
+
+        if not matched_list:
+            yield make_reply(event, 
+                f"⚠️ 未检索到与「{target}」匹配的学生绑定记录。\n"
+                "💡 请发送「/班级人员」查看当前所有已绑定名单。"
+            )
+            return
+
+        if len(matched_list) > 1:
+            lines = ["⚠️ 检索到多位匹配的学生记录："]
+            for item in matched_list:
+                cl = format_class_name(item.get("class_name", ""), item.get("student_id", ""))
+                lines.append(f"• {item.get('student_name')} ({item.get('student_id')}) - 班级: {cl} - QQ: {item.get('qq_id')}")
+            lines.append("💡 请输入具体【学号】或【QQ号】进行唯一定位解绑。")
+            yield make_reply(event, "\n".join(lines))
+            return
+
+        target_binding = matched_list[0]
+        to_delete_qq = target_binding.get("qq_id")
+
+        try:
+            del_resp = await async_api_delete(f"/api/bindings/{to_delete_qq}")
+        except Exception as e:
+            yield make_reply(event, f"❌ 调用解绑接口失败: {e}")
+            return
+
+        if del_resp.get("success"):
+            cl = format_class_name(target_binding.get("class_name", ""), target_binding.get("student_id", ""))
+            yield make_reply(event, 
+                "🗑️【助教解除绑定成功】\n"
+                "━━━━━━━━━━━━━━━\n"
+                f"👤 姓名：{target_binding.get('student_name')}\n"
+                f"🆔 学号：{target_binding.get('student_id')}\n"
+                f"🏫 班级：{cl}\n"
+                f"📱 对应 QQ：{target_binding.get('qq_id')}\n"
+                "👮 操作人：课程助教/管理员\n"
+                "━━━━━━━━━━━━━━━\n"
+                "💡 该学生身份已解绑，后续作业提交通道已重置。"
+            )
         else:
-            yield make_reply(event, f"⚠️ 解绑失败：{resp.get('error', '未找到绑定记录')}")
+            yield make_reply(event, f"⚠️ 解绑失败：{del_resp.get('error', '未知错误')}")
 
     @filter.command("班级人员", alias={"班级人员列表", "人员列表", "绑定列表", "已绑定列表", "绑定名单", "已绑定名单", "班级名单", "学生列表"})
     async def class_members_cmd(self, event: AstrMessageEvent, param: str = ""):
@@ -1462,6 +1602,23 @@ class HomeworkPlugin(Star):
         elif clean_text in ["解绑", "解除绑定"]:
             event.stop_event()
             async for r in self.unbind_student(event):
+                await reply(r)
+            return
+        elif clean_text.startswith("解绑 ") or clean_text.startswith("解除绑定 "):
+            event.stop_event()
+            p = clean_text.split(maxsplit=1)[1]
+            async for r in self.unbind_student(event, p):
+                await reply(r)
+            return
+        elif clean_text in ["指定绑定", "代绑", "代绑定"]:
+            event.stop_event()
+            async for r in self.assign_bind_student(event):
+                await reply(r)
+            return
+        elif clean_text.startswith("指定绑定 ") or clean_text.startswith("代绑 ") or clean_text.startswith("代绑定 "):
+            event.stop_event()
+            p = clean_text.split(maxsplit=1)[1]
+            async for r in self.assign_bind_student(event, p):
                 await reply(r)
             return
         elif clean_text in ["查重", "代码查重", "一键查重", "学术诚信", "查抄袭"]:
