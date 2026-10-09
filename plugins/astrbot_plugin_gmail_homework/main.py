@@ -284,6 +284,102 @@ def render_missing_list(data: dict) -> str:
     lines.append("━━━━━━━━━━━━━━━\n💡 提醒：请以上同学抓紧整理源码与实验报告，直接私聊机器人发送作业压缩包即可自动归档提交。")
     return "\n".join(lines)
 
+def is_querying_my_submission(text: str) -> bool:
+    """判断自然语言文本是否在询问个人作业提交状态（如：看看我交了吗、我交了没、查收等）"""
+    clean = re.sub(r"[？?！!，,。.\s~～@]+", "", text.strip())
+    if clean in ["查作业", "作业统计", "未交", "未交名单", "谁没交"]:
+        return False
+    patterns = [
+        r"交.*[了吗没]",
+        r"交没交",
+        r"看看我",
+        r"查查我",
+        r"查一下我",
+        r"帮我查",
+        r"查我",
+        r"我的作业",
+        r"作业.*[吗没]",
+        r"收到了[吗没]?",
+        r"收到没",
+        r"^查收",
+        r"^看看$",
+    ]
+    for pat in patterns:
+        if re.search(pat, clean):
+            return True
+    return False
+
+async def build_student_status_card(student_id: str, student_name: str, class_name: str) -> str:
+    """生成学生个人作业查收/提交状态汇总卡片"""
+    try:
+        assignments_resp = await async_api_get("/api/assignments")
+        assignments = assignments_resp.get("assignments", [])
+    except Exception:
+        assignments = []
+
+    if not assignments:
+        return "❌ 获取作业列表失败或当前未发布任何作业。"
+
+    if student_id == TA_STUDENT_ID or student_name == TA_NAME:
+        return f"👑 {TA_NAME} 为课程助教，无需提交作业哦~"
+
+    results = []
+    for a in assignments:
+        aid = a["id"]
+        a_name = a["name"]
+        dl = a.get("deadline", "")[:16].replace("T", " ")
+        try:
+            sub_data = await async_api_get(f"/api/assignments/{aid}/submissions")
+            matched_subs = [
+                s for s in sub_data.get("submissions", [])
+                if s.get("student_id") == student_id or s.get("student_name") == student_name
+            ]
+        except Exception:
+            matched_subs = []
+
+        if matched_subs:
+            s = matched_subs[0]
+            size_str = format_file_size(s.get("file_size", 0))
+            sub_time = s.get("submitted_at", "")[:16].replace("T", " ")
+            late_tag = " ⚠️【迟交】" if s.get("is_late") else ""
+            results.append(
+                f"🔹【{a_name}】：\n"
+                f"    ✅ 已成功提交归档{late_tag}\n"
+                f"    📁 附件：{s.get('target_filename')}\n"
+                f"    📦 大小：{size_str} | 🕒 提交时间：{sub_time}"
+            )
+        else:
+            try:
+                mis_data = await async_api_get(f"/api/assignments/{aid}/missing")
+                is_missing = any(
+                    m.get("student_id") == student_id or m.get("name") == student_name
+                    for m in (mis_data.get("missing_list") or [])
+                )
+            except Exception:
+                is_missing = False
+
+            if is_missing:
+                results.append(
+                    f"🔹【{a_name}】：\n"
+                    f"    ⚠️ 暂未查询到提交记录\n"
+                    f"    ⏳ 截止时间：{dl}"
+                )
+            else:
+                results.append(
+                    f"🔹【{a_name}】：\n"
+                    f"    ❓ 未在该次作业花名册中找到该学生"
+                )
+
+    c_show = format_class_name(class_name, student_id)
+    msg = (
+        f"👋【{student_name}】同学（{c_show}）你好！为你查到作业提交状态：\n"
+        "━━━━━━━━━━━━━━━\n"
+        + "\n".join(results)
+        + "\n━━━━━━━━━━━━━━━\n"
+        "💡 如需提交或更新作业，直接在私聊把新的压缩包发给我即可秒级自动入库！"
+    )
+    return msg
+
 def render_plagiarism_alert(upload_res: dict) -> str:
     """生成学术诚信查重拦截警报卡片（规范通告）"""
     dup = upload_res.get("duplicate") or {}
@@ -428,11 +524,24 @@ class HomeworkPlugin(Star):
             history.append(now)
             USER_QUERY_TIMESTAMPS[sender_id] = history
 
-        # 3. 动态注入专属助教人设与安全防御守则
+        # 3. 动态注入专属助教人设、当前学生身份与安全防御守则
+        student_ctx = ""
+        if event.is_private_chat():
+            try:
+                b_info = await async_api_get(f"/api/bindings/{sender_id}")
+            except Exception:
+                b_info = {}
+            if not b_info.get("error"):
+                s_name = b_info.get("student_name", "")
+                s_id = b_info.get("student_id", "")
+                s_cl = format_class_name(b_info.get("class_name", ""), s_id)
+                student_ctx = f"\n\n【当前对话学生信息】：姓名：{s_name}，学号：{s_id}，班级：{s_cl}。若学生询问自己的作业是否收到或提交情况，你可以调用 query_student_homework('{s_name}') 为其查询并在回复中告知结果。"
+
+        full_prompt = TA_PERSONA + student_ctx
         if req.system_prompt:
-            req.system_prompt = TA_PERSONA + "\n\n" + req.system_prompt
+            req.system_prompt = full_prompt + "\n\n" + req.system_prompt
         else:
-            req.system_prompt = TA_PERSONA
+            req.system_prompt = full_prompt
 
     @filter.llm_tool(name="query_student_homework")
     async def tool_query_student(self, event: AstrMessageEvent, student_name_or_id: str) -> str:
@@ -502,27 +611,24 @@ class HomeworkPlugin(Star):
     async def help_cmd(self, event: AstrMessageEvent):
         """显示作业助手指令菜单"""
         msg = (
-            "📖【并行计算课程 · 作业助手指令指南】\n"
+            "📖【并行计算课程 · 作业助手指南】\n"
             "━━━━━━━━━━━━━━━\n"
-            "🔹 学生作业通道（极速归档入库）：\n"
-            "1️⃣ /绑定 <学号> [姓名] —— 绑定学生身份（私聊或群聊均可）\n"
-            "    例：/绑定 240809010501 支全振\n"
-            "2️⃣ 私聊直接发作业压缩包 —— 自动识别身份，秒级规范命名并安全归档\n"
-            "3️⃣ /我的信息 —— 查看当前绑定的学号、姓名与班级信息\n\n"
-            "🔹 作业查询指令（群聊/私聊均可）：\n"
-            "4️⃣ /查作业 [序号] —— 查看当前作业提交统计概览\n"
-            "    例：/查作业 或 /查作业 2\n"
-            "5️⃣ /未交 [序号] —— 查看未交作业学生名单\n"
-            "    例：/未交 或 /未交 2\n"
-            "6️⃣ /查收 <姓名或学号> [序号] —— 自助查验个人作业是否已成功接收\n"
-            "    例：/查收 支全振 或 /查收 支全振 2\n\n"
-            "👑 助教/管理员专属指令：\n"
-            "7️⃣ 私聊发实验卡文件 —— 自动提取实验号、推算截止时间并一键发布通知与群文件\n"
-            "8️⃣ /导出作业 [序号] —— 打包指定作业并上传至群文件/私聊文件\n"
-            "9️⃣ /导出整学期 —— 一键打包导出整学期全量作业归档压缩包\n"
-            "🔟 /设为班级群 —— 在群内执行，将当前群标记为作业通告群\n"
-            "1️⃣1️⃣ /绑定列表 —— 查看所有已绑定的学生统计清单\n"
-            "1️⃣2️⃣ /查重 [序号] —— 查看代码哈希查重与学术诚信雷同报表"
+            "💡 提示：日常无需输入斜杠「/」，直接自然提问或发送口令即可！\n\n"
+            "🔹 常用口语与快捷查询（群聊/私聊均可）：\n"
+            "1️⃣「看看我交了吗？」或「我交了吗」—— 自动识别身份并播报个人作业归档状态\n"
+            "2️⃣「查作业」—— 查看当前作业提交总人数与比例概览\n"
+            "3️⃣「未交」—— 查看未交作业学生名单\n"
+            "4️⃣「我的信息」—— 查看当前绑定的学号、姓名与班级\n\n"
+            "🔹 作业提交与身份通道：\n"
+            "5️⃣ 私聊直接发作业压缩包 —— 自动识别身份，秒级规范命名并安全归档\n"
+            "6️⃣ 绑定 <学号> [姓名] —— 绑定学生身份（例：绑定 240809010501 支全振）\n"
+            "7️⃣ 查收 <姓名或学号> —— 自助查验指定同学作业（例：查收 支全振）\n\n"
+            "👑 助教/管理员专属：\n"
+            "8️⃣ 私聊发实验卡文件 —— 自动提取实验号并一键分发群文件与广播\n"
+            "9️⃣ 导出作业 / 导出整学期 —— 一键打包下载全量作业归档压缩包\n"
+            "🔟 设为班级群 —— 在群内执行，将当前群标记为作业通告群\n"
+            "1️⃣1️⃣ 绑定列表 —— 查看所有已绑定的学生统计清单\n"
+            "1️⃣2️⃣ 查重 [序号] —— 查看代码哈希查重与学术诚信雷同报表"
         )
         yield make_reply(event, msg)
 
@@ -1408,17 +1514,53 @@ class HomeworkPlugin(Star):
             st_name = b.get("student_name", "")
             cl_name = format_class_name(b.get("class_name", ""), sid)
 
+            b = bind_res.get("binding", {})
+            st_name = b.get("student_name", "")
+            cl_name = format_class_name(b.get("class_name", ""), sid)
+
+            status_card = await build_student_status_card(sid, st_name, cl_name)
             yield make_reply(event, 
-                f"🎉 绑定成功！欢迎【{st_name}】同学（{cl_name}）。\n"
+                f"🎉 绑定成功！欢迎【{st_name}】同学（{cl_name}）。\n\n"
+                f"{status_card}\n"
                 "━━━━━━━━━━━━━━━\n"
                 "现在你可以：\n"
                 "1️⃣ 随时向我提问课程概念、C/C++ 代码或并行计算报错\n"
                 "2️⃣ 直接私聊发送作业压缩包秒级提交入库\n"
-                "3️⃣ 发送 /查作业 查看当前提交状态"
+                "3️⃣ 直接问我「看看我交了吗」查看提交状态"
             )
             return
 
-        # 3.4 导出 / 查作业 / 未交 多轮选择
+        # 3.4 首次询问“看看我交了吗”后回复学号绑定并自动播报作业状态
+        if s_type == "bind_and_report_status":
+            sid = extract_student_id(text)
+            if not sid:
+                yield make_reply(event, "⚠️ 未识别到有效学号。请直接回复 12 位学号（例如：240809010501），回复 取消 退出。")
+                event.stop_event()
+                return
+
+            del PENDING_SESSIONS[session_key]
+            event.stop_event()
+
+            yield make_reply(event, f"⏳ 正在核对学号【{sid}】并查询作业状态...")
+
+            bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
+            if not bind_res.get("success"):
+                err = bind_res.get("error", "学号核验失败")
+                yield make_reply(event, f"❌ 绑定失败：{err}\n请核对学号是否在花名册中。")
+                return
+
+            b = bind_res.get("binding", {})
+            st_name = b.get("student_name", "")
+            cl_name = format_class_name(b.get("class_name", ""), sid)
+
+            status_card = await build_student_status_card(sid, st_name, cl_name)
+            yield make_reply(event, 
+                f"🎉 绑定成功！欢迎【{st_name}】同学（{cl_name}）！\n\n"
+                + status_card
+            )
+            return
+
+        # 3.5 导出 / 查作业 / 未交 多轮选择
         options = session_info.get("options", {})
         if text in options:
             del PENDING_SESSIONS[session_key]
@@ -1446,16 +1588,103 @@ class HomeworkPlugin(Star):
                     yield make_reply(event, f"❌ 查询未交名单失败: {e}")
                 return
 
-        if text.isdigit():
+        if text.isdigit() and session_info:
             yield make_reply(event, f"⚠️ 未找到序号 [{text}] 对应的作业选项，请回复有效序号，或回复 取消 退出。")
             event.stop_event()
             return
 
-        # 4. 私聊直接发送纯学号快速建立连接
+        # 4. 免「/」常规快捷口令处理
+        clean_text = text.strip()
+        if clean_text in ["查作业", "作业统计", "作业概览", "查看作业", "作业进度", "全部作业"]:
+            event.stop_event()
+            async for r in self.status_cmd(event):
+                yield r
+            return
+        elif clean_text in ["未交", "未交名单", "谁没交", "催交", "没交作业"]:
+            event.stop_event()
+            async for r in self.missing_cmd(event):
+                yield r
+            return
+        elif clean_text in ["帮助", "菜单", "作业帮助", "指令", "指令菜单"]:
+            event.stop_event()
+            async for r in self.help_cmd(event):
+                yield r
+            return
+        elif clean_text in ["我的信息", "我的绑定", "我是谁", "查询绑定"]:
+            event.stop_event()
+            async for r in self.my_info(event):
+                yield r
+            return
+        elif clean_text in ["解绑", "解除绑定"]:
+            event.stop_event()
+            async for r in self.unbind_student(event):
+                yield r
+            return
+        elif clean_text.startswith("绑定 ") or clean_text.startswith("绑定:"):
+            event.stop_event()
+            param = clean_text.split(maxsplit=1)[1] if " " in clean_text else clean_text.split(":", 1)[1]
+            async for r in self.bind_student(event, param):
+                yield r
+            return
+        elif clean_text.startswith("查收 ") or clean_text.startswith("查 "):
+            event.stop_event()
+            param = clean_text.split(maxsplit=1)[1]
+            async for r in self.check_student(event, param):
+                yield r
+            return
+
+        # 5. 自然语言口语化查询：“看看我交了吗？” / “我交了吗” / “交了没” / “查收”
+        if is_querying_my_submission(clean_text):
+            event.stop_event()
+
+            explicit_sid = extract_student_id(clean_text)
+            try:
+                bind_data = await async_api_get(f"/api/bindings/{sender_id}")
+            except Exception:
+                bind_data = {}
+
+            if not bind_data.get("error"):
+                # 机器人认识该同学（已绑定）
+                target_sid = explicit_sid if explicit_sid else bind_data.get("student_id", "")
+                target_name = bind_data.get("student_name", "") if not explicit_sid else ""
+                target_class = format_class_name(bind_data.get("class_name", ""), target_sid)
+                card = await build_student_status_card(target_sid, target_name, target_class)
+                yield make_reply(event, card)
+                return
+            else:
+                # 机器人还不认识该同学（未绑定）
+                if explicit_sid:
+                    # 提问中正好带了学号，直接尝试绑定并查询
+                    bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": explicit_sid})
+                    if bind_res.get("success"):
+                        b = bind_res.get("binding", {})
+                        st_name = b.get("student_name", "")
+                        cl_name = format_class_name(b.get("class_name", ""), explicit_sid)
+                        card = await build_student_status_card(explicit_sid, st_name, cl_name)
+                        yield make_reply(event, f"🎉 自动完成身份绑定：【{st_name}】同学（{cl_name}）！\n\n" + card)
+                        return
+
+                if is_private:
+                    PENDING_SESSIONS[session_key] = {
+                        "time": time.time(),
+                        "type": "bind_and_report_status",
+                    }
+                    yield make_reply(event, 
+                        "👋 同学你好呀！我还不认识你呢，你是哪位同学呀？\n"
+                        "请直接回复你的【学号】（例如：240809010501），我马上帮你核对并查询你的作业！"
+                    )
+                    return
+                else:
+                    yield make_reply(event, 
+                        "同学你好！我还不认识你呢，为了保护你的个人信息，请直接【私聊我】发送学号绑定，即可随时查询你的作业状态哦~"
+                    )
+                    return
+
+        # 6. 私聊直接发送纯学号快速建立连接并播报作业状态
         if is_private and not text.startswith("/") and not text.startswith("!"):
             sid = extract_student_id(text)
-            clean_text = text.replace(" ", "").replace("学号", "").replace("：", "").replace(":", "")
-            if sid and len(clean_text) <= 16:
+            clean_digits = text.replace(" ", "").replace("学号", "").replace("：", "").replace(":", "")
+            if sid and len(clean_digits) <= 16:
                 try:
                     check_b = await async_api_get(f"/api/bindings/{sender_id}")
                 except Exception:
@@ -1468,17 +1697,16 @@ class HomeworkPlugin(Star):
                     if bind_res.get("success"):
                         b = bind_res.get("binding", {})
                         cl_name = format_class_name(b.get("class_name", ""), sid)
+                        st_name = b.get("student_name", "")
+                        card = await build_student_status_card(sid, st_name, cl_name)
                         yield make_reply(event, 
                             f"🎉【学生身份绑定成功】\n"
                             "━━━━━━━━━━━━━━━\n"
-                            f"👤 学生姓名：{b.get('student_name')}\n"
+                            f"👤 学生姓名：{st_name}\n"
                             f"🆔 学号：{sid}\n"
                             f"🏫 班级：{cl_name}\n"
-                            "━━━━━━━━━━━━━━━\n"
-                            "💡 欢迎使用并行计算课程助手！现在你可以：\n"
-                            "1️⃣ 私聊发送作业压缩包 —— 自动秒级提交入库\n"
-                            "2️⃣ 私聊提问代码报错或学术疑问\n"
-                            "3️⃣ 发送 /查作业 查看提交进度"
+                            "━━━━━━━━━━━━━━━\n\n"
+                            + card
                         )
                         return
                     else:
