@@ -208,8 +208,6 @@ func (d *DB) migrate() error {
 			FOREIGN KEY(submission_id) REFERENCES submissions(id) ON DELETE CASCADE
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_submission_files_hash ON submission_files(assignment_id, sha256);`,
-		`CREATE INDEX IF NOT EXISTS idx_submission_files_norm_hash ON submission_files(assignment_id, normalized_sha256);`,
-		`CREATE INDEX IF NOT EXISTS idx_submission_files_struct_hash ON submission_files(assignment_id, structural_sha256);`,
 		`CREATE INDEX IF NOT EXISTS idx_submission_files_sub ON submission_files(submission_id);`,
 	}
 
@@ -219,9 +217,11 @@ func (d *DB) migrate() error {
 		}
 	}
 
-	// 兼容已有旧数据库实例的增量列迁移
+	// 兼容已有旧数据库实例的增量列迁移与索引创建
 	_, _ = d.conn.Exec(`ALTER TABLE submission_files ADD COLUMN normalized_sha256 TEXT DEFAULT '';`)
 	_, _ = d.conn.Exec(`ALTER TABLE submission_files ADD COLUMN structural_sha256 TEXT DEFAULT '';`)
+	_, _ = d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_submission_files_norm_hash ON submission_files(assignment_id, normalized_sha256);`)
+	_, _ = d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_submission_files_struct_hash ON submission_files(assignment_id, structural_sha256);`)
 
 	return nil
 }
