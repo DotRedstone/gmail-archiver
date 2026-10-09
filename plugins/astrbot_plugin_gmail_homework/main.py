@@ -251,6 +251,28 @@ def render_missing_list(data: dict) -> str:
     lines.append("━━━━━━━━━━━━━━━\n💡 铜齿轮快要急生锈啦！请以上同学抓紧整理源码与实验报告，直接私聊把压缩包丢给我即可秒级入库哦~")
     return "\n".join(lines)
 
+def render_plagiarism_alert(upload_res: dict) -> str:
+    """生成铜傀儡学术诚信查重拦截警报卡片"""
+    dup = upload_res.get("duplicate") or {}
+    dup_type_raw = dup.get("duplicate_type", "")
+    dup_type = "整包直接复制（压缩包完全一致）" if dup_type_raw == "exact_archive" else "换壳抄袭（核心源代码完全一致）"
+    files = dup.get("identical_files") or []
+    files_str = "、".join(files) if files else "全部代码文件"
+    matched_name = dup.get("matched_student_name", "其他同学")
+    matched_sid = dup.get("matched_student_id", "")
+    masked_sid = (matched_sid[:4] + "****" + matched_sid[-2:]) if len(matched_sid) > 6 else matched_sid
+
+    return (
+        "⚠️ *滋滋！避雷针雷电轰鸣！铜傀儡拉响学术诚信警报！*\n"
+        "━━━━━━━━━━━━━━━\n"
+        "❌ 作业归档被拒绝：哈希指纹查重未通过！\n"
+        f"🔍 判定类型：{dup_type}\n"
+        f"📌 碰撞源码：[{files_str}]\n"
+        f"👥 相同来源：同学【{matched_name}】({masked_sid})\n"
+        "━━━━━━━━━━━━━━━\n"
+        "💡 *咔哒！* 铜傀儡检测到你的代码文件 SHA256 哈希与他人完全一模一样，严禁仅修改姓名、文件名或实验报告互相抄袭！请独立完成代码后再行提交。"
+    )
+
 async def upload_file_action(event: AstrMessageEvent, download_url: str, filename: str, display_name: str):
     """通用文件直传操作"""
     bot = getattr(event, "bot", None)
@@ -466,7 +488,8 @@ class HomeworkPlugin(Star):
             "8️⃣ /导出作业 [序号] —— 打包任意作业战利品直接发送 QQ 文件\n"
             "9️⃣ /导出整学期 —— 一键打包整学期全部作业战利品箱\n"
             "🔟 /设为班级群 —— 在群内执行，将当前群标记为作业通告群\n"
-            "1️⃣1️⃣ /绑定列表 —— 检视所有已刻印铭牌的学生统计清单"
+            "1️⃣1️⃣ /绑定列表 —— 检视所有已刻印铭牌的学生统计清单\n"
+            "1️⃣2️⃣ /查重 [序号] —— 一键检视代码哈希查重与学术诚信雷同报表"
         )
         yield event.plain_result(msg)
 
@@ -927,6 +950,58 @@ class HomeworkPlugin(Star):
         async for res in upload_file_action(event, url, filename, "整学期全量作业"):
             yield res
 
+    # ---------------- 代码查重模块 ----------------
+    @filter.command("查重", alias={"代码查重", "学术诚信"})
+    async def plagiarism_cmd(self, event: AstrMessageEvent, param: str = ""):
+        """管理员查看作业哈希查重报告：/查重 或 /查重 2"""
+        if not is_admin(event):
+            yield event.plain_result("❌ 权限不足：代码查重仅限课程助教或管理员执行。")
+            return
+
+        assignments = get_assignments()
+        if not assignments:
+            yield event.plain_result("❌ 获取作业列表失败或当前未配置任何作业。")
+            return
+
+        param = param.strip()
+        target = match_assignment(param, assignments) if param else (assignments[0] if len(assignments) == 1 else assignments[-1])
+        if not target:
+            target = assignments[-1]
+
+        try:
+            data = api_get(f"/api/assignments/{target['id']}/plagiarism")
+        except Exception as e:
+            yield event.plain_result(f"❌ 获取查重数据失败: {e}")
+            return
+
+        pairs = data.get("pairs", [])
+        a_name = data.get("assignment_name", target.get("name", ""))
+
+        if not pairs:
+            yield event.plain_result(
+                f"🎉【{a_name} · 代码哈希查重报告】*Clack! 兴奋狂按铜按钮！*\n"
+                "━━━━━━━━━━━━━━━\n"
+                "✅ 战利品库全员代码指纹均为独立创作！\n"
+                "未检索到任何整包复制或换壳抄袭嫌疑记录。"
+            )
+            return
+
+        lines = [
+            f"🔍【{a_name} · 代码哈希查重报告】*Clack!*",
+            "━━━━━━━━━━━━━━━",
+            f"⚠️ 共检出 {len(pairs)} 组雷同嫌疑对：",
+        ]
+        for idx, p in enumerate(pairs, 1):
+            p_type = "整包直接复制" if p.get("duplicate_type") == "exact_archive" else "换壳抄袭核心代码"
+            f_str = "、".join(p.get("identical_files", []))
+            lines.append(f"{idx}️⃣ {p['student_a_name']}（{p['student_a']}）↔ {p['student_b_name']}（{p['student_b']}）")
+            lines.append(f"    • 判定类型：{p_type}")
+            lines.append(f"    • 碰撞源码：{f_str}")
+
+        lines.append("━━━━━━━━━━━━━━━")
+        lines.append("💡 建议助教与上述同学联系，核实源码实现与提交情况。")
+        yield event.plain_result("\n".join(lines))
+
     # ---------------- 消息与文件事件监听 ----------------
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL, priority=1)
     async def on_message_listener(self, event: AstrMessageEvent):
@@ -1056,6 +1131,9 @@ class HomeworkPlugin(Star):
                     pass
 
                 if not upload_res.get("success"):
+                    if upload_res.get("duplicate"):
+                        yield event.plain_result(render_plagiarism_alert(upload_res))
+                        return
                     yield event.plain_result(f"⚠️ 作业归档失败: {upload_res.get('error', '未知错误')}")
                     return
 
@@ -1235,6 +1313,11 @@ class HomeworkPlugin(Star):
                         pass
 
             if not upload_res.get("success"):
+                if upload_res.get("duplicate"):
+                    yield event.plain_result(
+                        f"✅ 铜铭牌已刻印成功：{st_name}（{cl_name}）！\n\n" + render_plagiarism_alert(upload_res)
+                    )
+                    return
                 yield event.plain_result(
                     f"✅ 身份连接成功：{st_name}（{cl_name}）！\n"
                     f"⚠️ 但作业归档失败：{upload_res.get('error', '未知错误')}\n"

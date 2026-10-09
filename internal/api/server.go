@@ -22,6 +22,7 @@ import (
 	"github.com/dot/gmail-archiver/internal/imap"
 	"github.com/dot/gmail-archiver/internal/rule"
 	"github.com/dot/gmail-archiver/internal/storage"
+	"github.com/dot/gmail-archiver/internal/verifier"
 )
 
 // [Server]
@@ -87,6 +88,7 @@ func (s *Server) Routes() http.Handler {
 			as.Get("/{id}/submissions/{student_id}/download", s.handleStudentSubmissionDownload)
 			as.Get("/{id}/submissions/{student_id}/history", s.handleStudentSubmissionHistory)
 			as.Get("/{id}/export", s.handleAssignmentExportZip)
+			as.Get("/{id}/plagiarism", s.handleAssignmentPlagiarism)
 			as.Post("/{id}/upload", s.handleAssignmentUpload)
 		})
 
@@ -896,6 +898,28 @@ func (s *Server) handleAssignmentUpload(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	absPath, err := s.storage.ResolveAbsolutePath(relPath)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to resolve file path: "+err.Error())
+		return
+	}
+
+	// 1. Extract internal files and perform plagiarism verification (archive hash & core code collision)
+	extractedFiles, _ := verifier.ExtractArchiveFiles(absPath)
+	dupCheck, dupErr := verifier.CheckSubmissionPlagiarism(s.database, targetRule.ID, finalID, hashHex, extractedFiles)
+	if dupErr != nil {
+		// Log warning but continue if db check errors
+	} else if dupCheck != nil && dupCheck.IsDuplicate {
+		// Clean up duplicate uploaded file on disk
+		_ = os.Remove(absPath)
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"success":   false,
+			"error":     dupCheck.Message,
+			"duplicate": dupCheck,
+		})
+		return
+	}
+
 	// Record attachment
 	att := &db.Attachment{
 		MessageID:   fmt.Sprintf("direct-upload-%d-%s", now.UnixNano(), hashHex[:8]),
@@ -932,6 +956,11 @@ func (s *Server) handleAssignmentUpload(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// 2. Persist extracted files hash index into database
+	if len(extractedFiles) > 0 {
+		_ = s.database.InsertSubmissionFiles(sub.ID, targetRule.ID, finalID, verifier.ToDBFiles(extractedFiles))
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":         true,
 		"assignment_id":   targetRule.ID,
@@ -946,6 +975,39 @@ func (s *Server) handleAssignmentUpload(w http.ResponseWriter, r *http.Request) 
 		"file_size":       fileSize,
 		"sha256":          hashHex,
 		"submitted_at":    now.Format(time.RFC3339),
+	})
+}
+
+// [AssignmentPlagiarismHandler]
+func (s *Server) handleAssignmentPlagiarism(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var targetRule *rule.AssignmentRule
+	if id == "latest" || id == "current" || id == "" {
+		targetRule = s.rules.LatestRule()
+	} else {
+		targetRule, _ = s.rules.GetRule(id)
+	}
+
+	if targetRule == nil {
+		writeJSONError(w, http.StatusNotFound, "assignment rule not found")
+		return
+	}
+
+	report, err := s.database.GetAssignmentPlagiarismReport(targetRule.ID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to query plagiarism report: "+err.Error())
+		return
+	}
+
+	if report == nil {
+		report = []*db.PlagiarismPair{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"assignment_id":   targetRule.ID,
+		"assignment_name": targetRule.Name,
+		"total_pairs":     len(report),
+		"pairs":           report,
 	})
 }
 

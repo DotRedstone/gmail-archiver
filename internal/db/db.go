@@ -61,6 +61,38 @@ type StudentBinding struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+type SubmissionFile struct {
+	ID           int64     `json:"id"`
+	SubmissionID int64     `json:"submission_id"`
+	AssignmentID string    `json:"assignment_id"`
+	StudentID    string    `json:"student_id"`
+	Filename     string    `json:"filename"`
+	Filepath     string    `json:"filepath"`
+	FileSize     int64     `json:"file_size"`
+	SHA256       string    `json:"sha256"`
+	IsCode       bool      `json:"is_code"`
+	IsCoreCode   bool      `json:"is_core_code"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+type CodeCollisionEntry struct {
+	MatchedStudentID   string `json:"matched_student_id"`
+	MatchedStudentName string `json:"matched_student_name"`
+	MatchedClass       string `json:"matched_class"`
+	Filename           string `json:"filename"`
+	OtherFilename      string `json:"other_filename"`
+	SHA256             string `json:"sha256"`
+}
+
+type PlagiarismPair struct {
+	StudentA       string   `json:"student_a"`
+	StudentAName   string   `json:"student_a_name"`
+	StudentB       string   `json:"student_b"`
+	StudentBName   string   `json:"student_b_name"`
+	DuplicateType  string   `json:"duplicate_type"` // "exact_archive" or "code_collision"
+	IdenticalFiles []string `json:"identical_files"`
+}
+
 // [Filter]
 type AttachmentFilter struct {
 	Keyword  string
@@ -156,6 +188,22 @@ func (d *DB) migrate() error {
 			updated_at DATETIME NOT NULL
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_student_bindings_student_id ON student_bindings(student_id);`,
+		`CREATE TABLE IF NOT EXISTS submission_files (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			submission_id INTEGER NOT NULL,
+			assignment_id TEXT NOT NULL,
+			student_id TEXT NOT NULL,
+			filename TEXT NOT NULL,
+			filepath TEXT NOT NULL,
+			file_size INTEGER NOT NULL,
+			sha256 TEXT NOT NULL,
+			is_code BOOLEAN NOT NULL DEFAULT 0,
+			is_core_code BOOLEAN NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL,
+			FOREIGN KEY(submission_id) REFERENCES submissions(id) ON DELETE CASCADE
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_submission_files_hash ON submission_files(assignment_id, sha256);`,
+		`CREATE INDEX IF NOT EXISTS idx_submission_files_sub ON submission_files(submission_id);`,
 	}
 
 	for _, q := range queries {
@@ -709,6 +757,189 @@ func (d *DB) DeleteStudentBinding(qqID string) error {
 	}
 	return nil
 }
+
+// [SubmissionFiles & Plagiarism Detection]
+
+func (d *DB) InsertSubmissionFiles(subID int64, assignmentID, studentID string, files []*SubmissionFile) error {
+	if len(files) == 0 {
+		return nil
+	}
+
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("db: begin tx for files: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.Prepare(`INSERT INTO submission_files (
+		submission_id, assignment_id, student_id, filename, filepath, file_size, sha256, is_code, is_core_code, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("db: prepare insert file stmt: %w", err)
+	}
+	defer stmt.Close()
+
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+	for _, f := range files {
+		_, err := stmt.Exec(
+			subID, assignmentID, studentID, f.Filename, f.Filepath, f.FileSize, f.SHA256, f.IsCode, f.IsCoreCode, nowStr,
+		)
+		if err != nil {
+			return fmt.Errorf("db: insert submission file: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// CheckArchiveSHA256Duplicate checks if another student has already submitted an identical archive file.
+func (d *DB) CheckArchiveSHA256Duplicate(assignmentID, currentStudentID, sha256Str string) (*Submission, error) {
+	query := `SELECT s.id, s.assignment_id, s.student_id, s.student_name, s.class_name,
+		s.attachment_id, s.submitted_at, s.version, s.is_latest, s.is_late, s.target_filename, s.created_at,
+		a.file_size, a.sha256, a.storage_path
+		FROM submissions s
+		JOIN attachments a ON s.attachment_id = a.id
+		WHERE s.assignment_id = ? AND s.student_id != ? AND s.is_latest = 1 AND a.sha256 = ?
+		LIMIT 1`
+
+	var sub Submission
+	var subAtStr, crAtStr string
+	err := d.conn.QueryRow(query, assignmentID, currentStudentID, sha256Str).Scan(
+		&sub.ID, &sub.AssignmentID, &sub.StudentID, &sub.StudentName, &sub.ClassName,
+		&sub.AttachmentID, &subAtStr, &sub.Version, &sub.IsLatest, &sub.IsLate, &sub.TargetFilename, &crAtStr,
+		&sub.FileSize, &sub.SHA256, &sub.StoragePath,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("db: check archive hash collision: %w", err)
+	}
+
+	sub.SubmittedAt, _ = time.Parse(time.RFC3339, subAtStr)
+	sub.CreatedAt, _ = time.Parse(time.RFC3339, crAtStr)
+	return &sub, nil
+}
+
+// FindCoreCodeCollisions finds if core source files match with another student's submission in the same assignment.
+func (d *DB) FindCoreCodeCollisions(assignmentID, currentStudentID string, coreHashes []string) ([]*CodeCollisionEntry, error) {
+	if len(coreHashes) == 0 {
+		return nil, nil
+	}
+
+	placeholders := make([]string, len(coreHashes))
+	args := make([]any, 0, len(coreHashes)+2)
+	args = append(args, assignmentID, currentStudentID)
+	for i, h := range coreHashes {
+		placeholders[i] = "?"
+		args = append(args, h)
+	}
+
+	query := fmt.Sprintf(`SELECT sf.student_id, s.student_name, s.class_name, sf.filename, sf.sha256
+		FROM submission_files sf
+		JOIN submissions s ON sf.submission_id = s.id
+		WHERE sf.assignment_id = ? AND sf.student_id != ? AND s.is_latest = 1 AND sf.is_core_code = 1
+		AND sf.sha256 IN (%s)
+		ORDER BY sf.student_id ASC`, strings.Join(placeholders, ","))
+
+	rows, err := d.conn.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: query core code collisions: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []*CodeCollisionEntry
+	for rows.Next() {
+		var e CodeCollisionEntry
+		if err := rows.Scan(&e.MatchedStudentID, &e.MatchedStudentName, &e.MatchedClass, &e.OtherFilename, &e.SHA256); err != nil {
+			return nil, fmt.Errorf("db: scan code collision: %w", err)
+		}
+		entries = append(entries, &e)
+	}
+
+	return entries, nil
+}
+
+// GetAssignmentPlagiarismReport builds a report of all duplicate/colliding submissions for an assignment.
+func (d *DB) GetAssignmentPlagiarismReport(assignmentID string) ([]*PlagiarismPair, error) {
+	// 1. Check exact archive duplicates
+	exactQuery := `SELECT s1.student_id, s1.student_name, s2.student_id, s2.student_name, a1.filename
+		FROM submissions s1
+		JOIN attachments a1 ON s1.attachment_id = a1.id
+		JOIN submissions s2 ON s1.assignment_id = s2.assignment_id AND s1.student_id < s2.student_id AND s2.is_latest = 1
+		JOIN attachments a2 ON s2.attachment_id = a2.id AND a1.sha256 = a2.sha256
+		WHERE s1.assignment_id = ? AND s1.is_latest = 1
+		ORDER BY s1.student_id ASC`
+
+	rows, err := d.conn.Query(exactQuery, assignmentID)
+	if err != nil {
+		return nil, fmt.Errorf("db: query exact archive duplicates: %w", err)
+	}
+	defer rows.Close()
+
+	var pairs []*PlagiarismPair
+	seenPairs := make(map[string]bool)
+
+	for rows.Next() {
+		var p PlagiarismPair
+		var fn string
+		if err := rows.Scan(&p.StudentA, &p.StudentAName, &p.StudentB, &p.StudentBName, &fn); err != nil {
+			return nil, err
+		}
+		p.DuplicateType = "exact_archive"
+		p.IdenticalFiles = []string{"整包压缩包完全相同 (SHA256 Collision)"}
+		key := fmt.Sprintf("%s-%s", p.StudentA, p.StudentB)
+		seenPairs[key] = true
+		pairs = append(pairs, &p)
+	}
+
+	// 2. Check core code file collisions
+	codeQuery := `SELECT sf1.student_id, s1.student_name, sf2.student_id, s2.student_name, sf1.filename
+		FROM submission_files sf1
+		JOIN submissions s1 ON sf1.submission_id = s1.id AND s1.is_latest = 1
+		JOIN submission_files sf2 ON sf1.assignment_id = sf2.assignment_id AND sf1.sha256 = sf2.sha256 AND sf1.student_id < sf2.student_id AND sf2.is_core_code = 1
+		JOIN submissions s2 ON sf2.submission_id = s2.id AND s2.is_latest = 1
+		WHERE sf1.assignment_id = ? AND sf1.is_core_code = 1
+		ORDER BY sf1.student_id, sf2.student_id`
+
+	cRows, err := d.conn.Query(codeQuery, assignmentID)
+	if err != nil {
+		return nil, fmt.Errorf("db: query code collisions: %w", err)
+	}
+	defer cRows.Close()
+
+	pairFileMap := make(map[string]*PlagiarismPair)
+	for cRows.Next() {
+		var sidA, nameA, sidB, nameB, fn string
+		if err := cRows.Scan(&sidA, &nameA, &sidB, &nameB, &fn); err != nil {
+			return nil, err
+		}
+		key := fmt.Sprintf("%s-%s", sidA, sidB)
+		if seenPairs[key] {
+			continue // Already reported as exact archive duplicate
+		}
+		if p, ok := pairFileMap[key]; ok {
+			p.IdenticalFiles = append(p.IdenticalFiles, fn)
+		} else {
+			pair := &PlagiarismPair{
+				StudentA:       sidA,
+				StudentAName:   nameA,
+				StudentB:       sidB,
+				StudentBName:   nameB,
+				DuplicateType:  "code_collision",
+				IdenticalFiles: []string{fn},
+			}
+			pairFileMap[key] = pair
+		}
+	}
+
+	for _, p := range pairFileMap {
+		pairs = append(pairs, p)
+	}
+
+	return pairs, nil
+}
+
 
 func (d *DB) ListStudentBindings() ([]*StudentBinding, error) {
 	query := `SELECT qq_id, student_id, student_name, class_name, created_at, updated_at

@@ -380,5 +380,32 @@ target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
 	if uploadResp["target_filename"] != expectedFilename {
 		t.Errorf("expected target_filename %s, got %v", expectedFilename, uploadResp["target_filename"])
 	}
+
+	// 18. Test Plagiarism Collision (Duplicate upload should be rejected with 409)
+	dupBodyBuf := &bytes.Buffer{}
+	dupMpWriter := multipart.NewWriter(dupBodyBuf)
+	_ = dupMpWriter.WriteField("student_id", "240809010502") // Different student
+	_ = dupMpWriter.WriteField("student_name", "田小雨")
+	dupFileWriter, _ := dupMpWriter.CreateFormFile("file", "copied_submission.zip")
+	_, _ = dupFileWriter.Write([]byte("fake zip archive content")) // Exact same content as 1689491386/240809010501!
+	_ = dupMpWriter.Close()
+
+	reqDupUpload := httptest.NewRequest("POST", "/api/assignments/latest/upload?token=secret-token-123", dupBodyBuf)
+	reqDupUpload.Header.Set("Content-Type", dupMpWriter.FormDataContentType())
+	recDupUpload := httptest.NewRecorder()
+	handler.ServeHTTP(recDupUpload, reqDupUpload)
+
+	if recDupUpload.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for duplicate upload, got %d: %s", recDupUpload.Code, recDupUpload.Body.String())
+	}
+
+	// 19. Test Plagiarism Report API
+	reqPlag := httptest.NewRequest("GET", "/api/assignments/latest/plagiarism?token=secret-token-123", nil)
+	recPlag := httptest.NewRecorder()
+	handler.ServeHTTP(recPlag, reqPlag)
+	if recPlag.Code != http.StatusOK {
+		t.Fatalf("expected 200 for plagiarism report, got %d: %s", recPlag.Code, recPlag.Body.String())
+	}
 }
+
 
