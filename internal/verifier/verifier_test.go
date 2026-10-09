@@ -165,14 +165,61 @@ func TestCheckSubmissionPlagiarism(t *testing.T) {
 	if err != nil {
 		t.Fatalf("check C: %v", err)
 	}
-	if !resC.IsDuplicate || resC.DuplicateType != "code_collision" {
-		t.Errorf("expected code_collision for Student C, got %+v", resC)
+	if !resC.IsDuplicate || resC.DuplicateType != "exact_code" {
+		t.Errorf("expected exact_code for Student C, got %+v", resC)
 	}
 	if resC.MatchedStudentID != "240809010001" {
 		t.Errorf("expected matched student 240809010001, got %s", resC.MatchedStudentID)
 	}
 
-	// 4. Student A updates their own homework (self-update should NEVER be blocked)
+	// 4. Student E modifies comments (Normalized Code collision)
+	filesE := []*ArchivedFileInfo{
+		{
+			Filename:         "gemm.cu",
+			Path:             "src/gemm.cu",
+			Size:             510,
+			SHA256:           "sha-diff-because-comments-changed",
+			NormalizedSHA256: "sha-norm-same-zhangsan",
+			StructuralSHA256: "sha-struct-same-zhangsan",
+			Category:         CategoryCoreCode,
+			IsCoreCode:       true,
+		},
+	}
+	// Give Student A's file in DB the normalized hash
+	filesA[0].NormalizedSHA256 = "sha-norm-same-zhangsan"
+	filesA[0].StructuralSHA256 = "sha-struct-same-zhangsan"
+	_ = database.InsertSubmissionFiles(subA.ID, "parallel_computing_lab2", "240809010001", ToDBFiles(filesA))
+
+	resE, err := CheckSubmissionPlagiarism(database, "parallel_computing_lab2", "240809010005", "hash-archive-student-e", filesE)
+	if err != nil {
+		t.Fatalf("check E: %v", err)
+	}
+	if !resE.IsDuplicate || resE.DuplicateType != "normalized_code" {
+		t.Errorf("expected normalized_code for Student E, got %+v", resE)
+	}
+
+	// 5. Student F renames variables (Structural Code collision)
+	filesF := []*ArchivedFileInfo{
+		{
+			Filename:         "gemm.cu",
+			Path:             "src/gemm.cu",
+			Size:             520,
+			SHA256:           "sha-diff-vars-renamed",
+			NormalizedSHA256: "sha-norm-diff",
+			StructuralSHA256: "sha-struct-same-zhangsan",
+			Category:         CategoryCoreCode,
+			IsCoreCode:       true,
+		},
+	}
+	resF, err := CheckSubmissionPlagiarism(database, "parallel_computing_lab2", "240809010006", "hash-archive-student-f", filesF)
+	if err != nil {
+		t.Fatalf("check F: %v", err)
+	}
+	if !resF.IsDuplicate || resF.DuplicateType != "structural_code" {
+		t.Errorf("expected structural_code for Student F, got %+v", resF)
+	}
+
+	// 6. Student A updates their own homework (self-update should NEVER be blocked)
 	resSelf, err := CheckSubmissionPlagiarism(database, "parallel_computing_lab2", "240809010001", "hash-archive-student-a", filesA)
 	if err != nil {
 		t.Fatalf("check self: %v", err)
@@ -181,7 +228,7 @@ func TestCheckSubmissionPlagiarism(t *testing.T) {
 		t.Errorf("expected self update to not be flagged as duplicate, got %+v", resSelf)
 	}
 
-	// 5. Student D submits their own independent work
+	// 7. Student D submits their own independent work
 	filesD := []*ArchivedFileInfo{
 		{
 			Filename:   "gemm.cu",

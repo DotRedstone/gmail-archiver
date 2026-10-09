@@ -62,17 +62,19 @@ type StudentBinding struct {
 }
 
 type SubmissionFile struct {
-	ID           int64     `json:"id"`
-	SubmissionID int64     `json:"submission_id"`
-	AssignmentID string    `json:"assignment_id"`
-	StudentID    string    `json:"student_id"`
-	Filename     string    `json:"filename"`
-	Filepath     string    `json:"filepath"`
-	FileSize     int64     `json:"file_size"`
-	SHA256       string    `json:"sha256"`
-	IsCode       bool      `json:"is_code"`
-	IsCoreCode   bool      `json:"is_core_code"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID               int64     `json:"id"`
+	SubmissionID     int64     `json:"submission_id"`
+	AssignmentID     string    `json:"assignment_id"`
+	StudentID        string    `json:"student_id"`
+	Filename         string    `json:"filename"`
+	Filepath         string    `json:"filepath"`
+	FileSize         int64     `json:"file_size"`
+	SHA256           string    `json:"sha256"`
+	NormalizedSHA256 string    `json:"normalized_sha256,omitempty"`
+	StructuralSHA256 string    `json:"structural_sha256,omitempty"`
+	IsCode           bool      `json:"is_code"`
+	IsCoreCode       bool      `json:"is_core_code"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 type CodeCollisionEntry struct {
@@ -82,6 +84,7 @@ type CodeCollisionEntry struct {
 	Filename           string `json:"filename"`
 	OtherFilename      string `json:"other_filename"`
 	SHA256             string `json:"sha256"`
+	CollisionType      string `json:"collision_type"` // "exact_code", "normalized_code", "structural_code"
 }
 
 type PlagiarismPair struct {
@@ -89,7 +92,7 @@ type PlagiarismPair struct {
 	StudentAName   string   `json:"student_a_name"`
 	StudentB       string   `json:"student_b"`
 	StudentBName   string   `json:"student_b_name"`
-	DuplicateType  string   `json:"duplicate_type"` // "exact_archive" or "code_collision"
+	DuplicateType  string   `json:"duplicate_type"` // "exact_archive", "exact_code", "normalized_code", "structural_code"
 	IdenticalFiles []string `json:"identical_files"`
 }
 
@@ -197,12 +200,16 @@ func (d *DB) migrate() error {
 			filepath TEXT NOT NULL,
 			file_size INTEGER NOT NULL,
 			sha256 TEXT NOT NULL,
+			normalized_sha256 TEXT DEFAULT '',
+			structural_sha256 TEXT DEFAULT '',
 			is_code BOOLEAN NOT NULL DEFAULT 0,
 			is_core_code BOOLEAN NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL,
 			FOREIGN KEY(submission_id) REFERENCES submissions(id) ON DELETE CASCADE
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_submission_files_hash ON submission_files(assignment_id, sha256);`,
+		`CREATE INDEX IF NOT EXISTS idx_submission_files_norm_hash ON submission_files(assignment_id, normalized_sha256);`,
+		`CREATE INDEX IF NOT EXISTS idx_submission_files_struct_hash ON submission_files(assignment_id, structural_sha256);`,
 		`CREATE INDEX IF NOT EXISTS idx_submission_files_sub ON submission_files(submission_id);`,
 	}
 
@@ -211,6 +218,11 @@ func (d *DB) migrate() error {
 			return err
 		}
 	}
+
+	// 兼容已有旧数据库实例的增量列迁移
+	_, _ = d.conn.Exec(`ALTER TABLE submission_files ADD COLUMN normalized_sha256 TEXT DEFAULT '';`)
+	_, _ = d.conn.Exec(`ALTER TABLE submission_files ADD COLUMN structural_sha256 TEXT DEFAULT '';`)
+
 	return nil
 }
 
@@ -760,6 +772,13 @@ func (d *DB) DeleteStudentBinding(qqID string) error {
 
 // [SubmissionFiles & Plagiarism Detection]
 
+type CoreCodeItem struct {
+	Filename         string
+	SHA256           string
+	NormalizedSHA256 string
+	StructuralSHA256 string
+}
+
 func (d *DB) InsertSubmissionFiles(subID int64, assignmentID, studentID string, files []*SubmissionFile) error {
 	if len(files) == 0 {
 		return nil
@@ -772,8 +791,8 @@ func (d *DB) InsertSubmissionFiles(subID int64, assignmentID, studentID string, 
 	defer func() { _ = tx.Rollback() }()
 
 	stmt, err := tx.Prepare(`INSERT INTO submission_files (
-		submission_id, assignment_id, student_id, filename, filepath, file_size, sha256, is_code, is_core_code, created_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		submission_id, assignment_id, student_id, filename, filepath, file_size, sha256, normalized_sha256, structural_sha256, is_code, is_core_code, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("db: prepare insert file stmt: %w", err)
 	}
@@ -782,7 +801,7 @@ func (d *DB) InsertSubmissionFiles(subID int64, assignmentID, studentID string, 
 	nowStr := time.Now().UTC().Format(time.RFC3339)
 	for _, f := range files {
 		_, err := stmt.Exec(
-			subID, assignmentID, studentID, f.Filename, f.Filepath, f.FileSize, f.SHA256, f.IsCode, f.IsCoreCode, nowStr,
+			subID, assignmentID, studentID, f.Filename, f.Filepath, f.FileSize, f.SHA256, f.NormalizedSHA256, f.StructuralSHA256, f.IsCode, f.IsCoreCode, nowStr,
 		)
 		if err != nil {
 			return fmt.Errorf("db: insert submission file: %w", err)
@@ -822,39 +841,50 @@ func (d *DB) CheckArchiveSHA256Duplicate(assignmentID, currentStudentID, sha256S
 }
 
 // FindCoreCodeCollisions finds if core source files match with another student's submission in the same assignment.
-func (d *DB) FindCoreCodeCollisions(assignmentID, currentStudentID string, coreHashes []string) ([]*CodeCollisionEntry, error) {
-	if len(coreHashes) == 0 {
+func (d *DB) FindCoreCodeCollisions(assignmentID, currentStudentID string, items []*CoreCodeItem) ([]*CodeCollisionEntry, error) {
+	if len(items) == 0 {
 		return nil, nil
 	}
 
-	placeholders := make([]string, len(coreHashes))
-	args := make([]any, 0, len(coreHashes)+2)
-	args = append(args, assignmentID, currentStudentID)
-	for i, h := range coreHashes {
-		placeholders[i] = "?"
-		args = append(args, h)
-	}
-
-	query := fmt.Sprintf(`SELECT sf.student_id, s.student_name, s.class_name, sf.filename, sf.sha256
-		FROM submission_files sf
-		JOIN submissions s ON sf.submission_id = s.id
-		WHERE sf.assignment_id = ? AND sf.student_id != ? AND s.is_latest = 1 AND sf.is_core_code = 1
-		AND sf.sha256 IN (%s)
-		ORDER BY sf.student_id ASC`, strings.Join(placeholders, ","))
-
-	rows, err := d.conn.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("db: query core code collisions: %w", err)
-	}
-	defer rows.Close()
-
 	var entries []*CodeCollisionEntry
-	for rows.Next() {
-		var e CodeCollisionEntry
-		if err := rows.Scan(&e.MatchedStudentID, &e.MatchedStudentName, &e.MatchedClass, &e.OtherFilename, &e.SHA256); err != nil {
-			return nil, fmt.Errorf("db: scan code collision: %w", err)
+	for _, item := range items {
+		query := `SELECT sf.student_id, s.student_name, s.class_name, sf.filename, sf.sha256, sf.normalized_sha256, sf.structural_sha256
+			FROM submission_files sf
+			JOIN submissions s ON sf.submission_id = s.id
+			WHERE sf.assignment_id = ? AND sf.student_id != ? AND s.is_latest = 1 AND sf.is_core_code = 1
+			AND (
+				sf.sha256 = ?
+				OR (? != '' AND sf.normalized_sha256 = ?)
+				OR (? != '' AND sf.structural_sha256 = ?)
+			)
+			ORDER BY sf.student_id ASC`
+
+		rows, err := d.conn.Query(query, assignmentID, currentStudentID, item.SHA256, item.NormalizedSHA256, item.NormalizedSHA256, item.StructuralSHA256, item.StructuralSHA256)
+		if err != nil {
+			return nil, fmt.Errorf("db: query core code collisions: %w", err)
 		}
-		entries = append(entries, &e)
+
+		for rows.Next() {
+			var e CodeCollisionEntry
+			var rowSHA, rowNorm, rowStruct string
+			if err := rows.Scan(&e.MatchedStudentID, &e.MatchedStudentName, &e.MatchedClass, &e.OtherFilename, &rowSHA, &rowNorm, &rowStruct); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("db: scan code collision: %w", err)
+			}
+			e.Filename = item.Filename
+			e.SHA256 = rowSHA
+			if rowSHA == item.SHA256 {
+				e.CollisionType = "exact_code"
+			} else if item.NormalizedSHA256 != "" && rowNorm == item.NormalizedSHA256 {
+				e.CollisionType = "normalized_code"
+			} else if item.StructuralSHA256 != "" && rowStruct == item.StructuralSHA256 {
+				e.CollisionType = "structural_code"
+			} else {
+				e.CollisionType = "exact_code"
+			}
+			entries = append(entries, &e)
+		}
+		rows.Close()
 	}
 
 	return entries, nil
@@ -862,6 +892,9 @@ func (d *DB) FindCoreCodeCollisions(assignmentID, currentStudentID string, coreH
 
 // GetAssignmentPlagiarismReport builds a report of all duplicate/colliding submissions for an assignment.
 func (d *DB) GetAssignmentPlagiarismReport(assignmentID string) ([]*PlagiarismPair, error) {
+	var pairs []*PlagiarismPair
+	seenPairs := make(map[string]bool)
+
 	// 1. Check exact archive duplicates
 	exactQuery := `SELECT s1.student_id, s1.student_name, s2.student_id, s2.student_name, a1.filename
 		FROM submissions s1
@@ -875,66 +908,93 @@ func (d *DB) GetAssignmentPlagiarismReport(assignmentID string) ([]*PlagiarismPa
 	if err != nil {
 		return nil, fmt.Errorf("db: query exact archive duplicates: %w", err)
 	}
-	defer rows.Close()
-
-	var pairs []*PlagiarismPair
-	seenPairs := make(map[string]bool)
-
 	for rows.Next() {
 		var p PlagiarismPair
 		var fn string
 		if err := rows.Scan(&p.StudentA, &p.StudentAName, &p.StudentB, &p.StudentBName, &fn); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		p.DuplicateType = "exact_archive"
 		p.IdenticalFiles = []string{"整包压缩包完全相同 (SHA256 Collision)"}
-		key := fmt.Sprintf("%s-%s", p.StudentA, p.StudentB)
-		seenPairs[key] = true
+		seenPairs[fmt.Sprintf("%s-%s", p.StudentA, p.StudentB)] = true
 		pairs = append(pairs, &p)
 	}
+	rows.Close()
 
-	// 2. Check core code file collisions
-	codeQuery := `SELECT sf1.student_id, s1.student_name, sf2.student_id, s2.student_name, sf1.filename
+	// Helper for checking code collision tiers
+	checkCodeQuery := func(query string, dupType string) error {
+		cRows, err := d.conn.Query(query, assignmentID)
+		if err != nil {
+			return err
+		}
+		defer cRows.Close()
+
+		pairFileMap := make(map[string]*PlagiarismPair)
+		for cRows.Next() {
+			var sidA, nameA, sidB, nameB, fn string
+			if err := cRows.Scan(&sidA, &nameA, &sidB, &nameB, &fn); err != nil {
+				return err
+			}
+			key := fmt.Sprintf("%s-%s", sidA, sidB)
+			if seenPairs[key] {
+				continue
+			}
+			if p, ok := pairFileMap[key]; ok {
+				p.IdenticalFiles = append(p.IdenticalFiles, fn)
+			} else {
+				pairFileMap[key] = &PlagiarismPair{
+					StudentA:       sidA,
+					StudentAName:   nameA,
+					StudentB:       sidB,
+					StudentBName:   nameB,
+					DuplicateType:  dupType,
+					IdenticalFiles: []string{fn},
+				}
+			}
+		}
+
+		for k, p := range pairFileMap {
+			seenPairs[k] = true
+			pairs = append(pairs, p)
+		}
+		return nil
+	}
+
+	// 2. Exact code collisions
+	exactCodeQuery := `SELECT sf1.student_id, s1.student_name, sf2.student_id, s2.student_name, sf1.filename
 		FROM submission_files sf1
 		JOIN submissions s1 ON sf1.submission_id = s1.id AND s1.is_latest = 1
 		JOIN submission_files sf2 ON sf1.assignment_id = sf2.assignment_id AND sf1.sha256 = sf2.sha256 AND sf1.student_id < sf2.student_id AND sf2.is_core_code = 1
 		JOIN submissions s2 ON sf2.submission_id = s2.id AND s2.is_latest = 1
 		WHERE sf1.assignment_id = ? AND sf1.is_core_code = 1
 		ORDER BY sf1.student_id, sf2.student_id`
-
-	cRows, err := d.conn.Query(codeQuery, assignmentID)
-	if err != nil {
-		return nil, fmt.Errorf("db: query code collisions: %w", err)
-	}
-	defer cRows.Close()
-
-	pairFileMap := make(map[string]*PlagiarismPair)
-	for cRows.Next() {
-		var sidA, nameA, sidB, nameB, fn string
-		if err := cRows.Scan(&sidA, &nameA, &sidB, &nameB, &fn); err != nil {
-			return nil, err
-		}
-		key := fmt.Sprintf("%s-%s", sidA, sidB)
-		if seenPairs[key] {
-			continue // Already reported as exact archive duplicate
-		}
-		if p, ok := pairFileMap[key]; ok {
-			p.IdenticalFiles = append(p.IdenticalFiles, fn)
-		} else {
-			pair := &PlagiarismPair{
-				StudentA:       sidA,
-				StudentAName:   nameA,
-				StudentB:       sidB,
-				StudentBName:   nameB,
-				DuplicateType:  "code_collision",
-				IdenticalFiles: []string{fn},
-			}
-			pairFileMap[key] = pair
-		}
+	if err := checkCodeQuery(exactCodeQuery, "exact_code"); err != nil {
+		return nil, fmt.Errorf("db: query exact code collisions: %w", err)
 	}
 
-	for _, p := range pairFileMap {
-		pairs = append(pairs, p)
+	// 3. Normalized code collisions (comments stripped, formatting normalized)
+	normCodeQuery := `SELECT sf1.student_id, s1.student_name, sf2.student_id, s2.student_name, sf1.filename
+		FROM submission_files sf1
+		JOIN submissions s1 ON sf1.submission_id = s1.id AND s1.is_latest = 1
+		JOIN submission_files sf2 ON sf1.assignment_id = sf2.assignment_id AND sf1.normalized_sha256 = sf2.normalized_sha256 AND sf1.normalized_sha256 != '' AND sf1.student_id < sf2.student_id AND sf2.is_core_code = 1
+		JOIN submissions s2 ON sf2.submission_id = s2.id AND s2.is_latest = 1
+		WHERE sf1.assignment_id = ? AND sf1.is_core_code = 1 AND sf1.normalized_sha256 != ''
+		ORDER BY sf1.student_id, sf2.student_id`
+	if err := checkCodeQuery(normCodeQuery, "normalized_code"); err != nil {
+		return nil, fmt.Errorf("db: query normalized code collisions: %w", err)
+	}
+
+	// 4. Structural code collisions (variable & identifier renaming canonicalized)
+	structCodeQuery := `SELECT sf1.student_id, s1.student_name, sf2.student_id, s2.student_name, sf1.filename
+		FROM submission_files sf1
+		JOIN submissions s1 ON sf1.submission_id = s1.id AND s1.is_latest = 1
+		JOIN submission_files sf2 ON sf1.assignment_id = sf2.assignment_id AND sf1.structural_sha256 = sf2.structural_sha256 AND sf1.structural_sha256 != '' AND sf1.student_id < sf2.student_id AND sf2.is_core_code = 1
+		JOIN submissions s2 ON sf2.submission_id = s2.id AND s2.is_latest = 1
+		WHERE sf1.assignment_id = ? AND sf1.is_core_code = 1 AND sf1.structural_sha256 != ''
+		ORDER BY sf1.student_id, sf2.student_id`
+	if err := checkCodeQuery(structCodeQuery, "structural_code"); err != nil {
+		return nil, fmt.Errorf("db: query structural code collisions: %w", err)
 	}
 
 	return pairs, nil

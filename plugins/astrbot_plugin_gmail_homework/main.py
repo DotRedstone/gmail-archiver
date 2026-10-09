@@ -434,11 +434,38 @@ async def build_student_status_card(student_id: str, student_name: str, class_na
     )
     return msg
 
+def format_plagiarism_type(dup_type_raw: str) -> tuple:
+    """返回 (判定类型标签, 详细防抄袭说明)"""
+    if dup_type_raw == "exact_archive":
+        return (
+            "整包直接复制（压缩包完全一致）",
+            "检测到你的压缩包文件哈希与已提交同学完全一致。严禁直接复制压缩包提交！请独立完成实验后再行提交。"
+        )
+    elif dup_type_raw == "exact_code":
+        return (
+            "源码完全一致（原代码未做修改）",
+            "检测到你的核心源代码文件与已提交同学完全一致。严禁仅修改文件名或实验报告互相抄袭！请独立编写代码后再行提交。"
+        )
+    elif dup_type_raw == "normalized_code":
+        return (
+            "换壳抄袭（仅修改注释姓名或排版格式）",
+            "检测到你的代码逻辑与已提交同学完全一致（仅修改了注释姓名或排版缩进）。系统已自动穿透注释层比对，请独立完成实验！"
+        )
+    elif dup_type_raw == "structural_code":
+        return (
+            "换壳抄袭（核心算法结构100%雷同，仅替换变量名/函数名）",
+            "检测到你的代码语法结构与算法逻辑与已提交同学 100% 雷同（仅重命名了变量名或函数名）。代码抽象语法树校验未通过，请独立完成实验！"
+        )
+    return (
+        "换壳抄袭（核心源码高度雷同）",
+        "检测到你的核心代码与已提交同学高度雷同。严禁抄袭他人代码，请独立完成实验！"
+    )
+
 def render_plagiarism_alert(upload_res: dict) -> str:
     """生成学术诚信查重拦截警报卡片（规范通告）"""
     dup = upload_res.get("duplicate") or {}
     dup_type_raw = dup.get("duplicate_type", "")
-    dup_type = "整包直接复制（压缩包完全一致）" if dup_type_raw == "exact_archive" else "换壳抄袭（核心源代码完全一致）"
+    dup_type, desc_str = format_plagiarism_type(dup_type_raw)
     files = dup.get("identical_files") or []
     files_str = "、".join(files) if files else "全部代码文件"
     matched_name = dup.get("matched_student_name", "其他同学")
@@ -448,12 +475,12 @@ def render_plagiarism_alert(upload_res: dict) -> str:
     return (
         "⚠️【学术诚信拦截警报】\n"
         "━━━━━━━━━━━━━━━\n"
-        "❌ 作业归档被拒绝：哈希指纹查重未通过！\n"
+        "❌ 作业归档被拒绝：代码查重与指纹校验未通过！\n"
         f"🔍 判定类型：{dup_type}\n"
         f"📌 碰撞源码：[{files_str}]\n"
         f"👥 相同来源：同学【{matched_name}】({masked_sid})\n"
         "━━━━━━━━━━━━━━━\n"
-        "💡 说明：检测到你的代码文件 SHA256 哈希与已提交同学完全一致。严禁仅修改姓名、文件名或实验报告互相抄袭！请独立完成代码后再行提交。"
+        f"💡 说明：{desc_str}"
     )
 
 async def upload_file_action(event: AstrMessageEvent, download_url: str, filename: str, display_name: str):
@@ -1303,7 +1330,7 @@ class HomeworkPlugin(Star):
                 f"⚠️ 共检出 {len(pairs)} 组雷同嫌疑记录：",
             ]
             for idx, p in enumerate(pairs, 1):
-                p_type = "整包直接复制（压缩包完全一致）" if p.get("duplicate_type") == "exact_archive" else "换壳抄袭（核心源代码完全一致）"
+                p_type, _ = format_plagiarism_type(p.get("duplicate_type"))
                 f_str = "、".join(p.get("identical_files", []))
                 lines.append(f"{idx}️⃣ {p['student_a_name']}（{p['student_a']}）↔ {p['student_b_name']}（{p['student_b']}）")
                 lines.append(f"    • 判定类型：{p_type}")
@@ -1332,7 +1359,7 @@ class HomeworkPlugin(Star):
                     summary_lines.append(f"⚠️ {idx}️⃣ {a_name}：检出 {len(pairs)} 组雷同嫌疑！")
                     block = [f"📌【{a_name} 雷同明细】："]
                     for p_idx, p in enumerate(pairs, 1):
-                        p_type = "整包直接复制" if p.get("duplicate_type") == "exact_archive" else "换壳抄袭"
+                        p_type, _ = format_plagiarism_type(p.get("duplicate_type"))
                         f_str = "、".join(p.get("identical_files", []))
                         block.append(f"  {p_idx}. {p['student_a_name']}（{p['student_a']}）↔ {p['student_b_name']}（{p['student_b']}） [{p_type}]")
                         block.append(f"     碰撞源码：{f_str}")

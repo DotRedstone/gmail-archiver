@@ -27,12 +27,14 @@ const (
 
 // ArchivedFileInfo holds metadata and content hash of a file inside a submission.
 type ArchivedFileInfo struct {
-	Path       string       `json:"path"`
-	Filename   string       `json:"filename"`
-	Size       int64        `json:"size"`
-	SHA256     string       `json:"sha256"`
-	Category   FileCategory `json:"category"`
-	IsCoreCode bool         `json:"is_core_code"`
+	Path             string       `json:"path"`
+	Filename         string       `json:"filename"`
+	Size             int64        `json:"size"`
+	SHA256           string       `json:"sha256"`
+	NormalizedSHA256 string       `json:"normalized_sha256,omitempty"`
+	StructuralSHA256 string       `json:"structural_sha256,omitempty"`
+	Category         FileCategory `json:"category"`
+	IsCoreCode       bool         `json:"is_core_code"`
 }
 
 // PlagiarismCheckResult represents the outcome of duplicate/hash verification.
@@ -127,23 +129,36 @@ func extractZip(absPath string) ([]*ArchivedFileInfo, error) {
 			continue
 		}
 
-		hasher := sha256.New()
-		written, copyErr := io.Copy(hasher, rc)
+		buf, copyErr := io.ReadAll(rc)
 		_ = rc.Close()
 		if copyErr != nil {
 			continue
 		}
 
+		written := int64(len(buf))
+		hasher := sha256.New()
+		hasher.Write(buf)
 		hashHex := hex.EncodeToString(hasher.Sum(nil))
 		cat, isCore := classifyFile(f.Name, written)
 
+		var normSHA, structSHA string
+		if (isCore || cat == CategoryCode) && written <= 5*1024*1024 {
+			normRes := ComputeNormalizedCode(buf, f.Name)
+			if normRes.MinCoreThreshold {
+				normSHA = normRes.NormalizedSHA256
+				structSHA = normRes.StructuralSHA256
+			}
+		}
+
 		files = append(files, &ArchivedFileInfo{
-			Path:       filepath.ToSlash(f.Name),
-			Filename:   filepath.Base(f.Name),
-			Size:       written,
-			SHA256:     hashHex,
-			Category:   cat,
-			IsCoreCode: isCore,
+			Path:             filepath.ToSlash(f.Name),
+			Filename:         filepath.Base(f.Name),
+			Size:             written,
+			SHA256:           hashHex,
+			NormalizedSHA256: normSHA,
+			StructuralSHA256: structSHA,
+			Category:         cat,
+			IsCoreCode:       isCore,
 		})
 	}
 
@@ -195,22 +210,35 @@ func readTarStream(r io.Reader) ([]*ArchivedFileInfo, error) {
 			continue
 		}
 
-		hasher := sha256.New()
-		written, copyErr := io.Copy(hasher, tr)
+		buf, copyErr := io.ReadAll(tr)
 		if copyErr != nil {
 			continue
 		}
 
+		written := int64(len(buf))
+		hasher := sha256.New()
+		hasher.Write(buf)
 		hashHex := hex.EncodeToString(hasher.Sum(nil))
 		cat, isCore := classifyFile(header.Name, written)
 
+		var normSHA, structSHA string
+		if (isCore || cat == CategoryCode) && written <= 5*1024*1024 {
+			normRes := ComputeNormalizedCode(buf, header.Name)
+			if normRes.MinCoreThreshold {
+				normSHA = normRes.NormalizedSHA256
+				structSHA = normRes.StructuralSHA256
+			}
+		}
+
 		files = append(files, &ArchivedFileInfo{
-			Path:       filepath.ToSlash(header.Name),
-			Filename:   filepath.Base(header.Name),
-			Size:       written,
-			SHA256:     hashHex,
-			Category:   cat,
-			IsCoreCode: isCore,
+			Path:             filepath.ToSlash(header.Name),
+			Filename:         filepath.Base(header.Name),
+			Size:             written,
+			SHA256:           hashHex,
+			NormalizedSHA256: normSHA,
+			StructuralSHA256: structSHA,
+			Category:         cat,
+			IsCoreCode:       isCore,
 		})
 	}
 
@@ -229,23 +257,36 @@ func extractSingleFile(absPath string) ([]*ArchivedFileInfo, error) {
 		return nil, err
 	}
 
-	hasher := sha256.New()
-	written, err := io.Copy(hasher, f)
+	buf, err := io.ReadAll(f)
 	if err != nil {
 		return nil, err
 	}
 
+	written := int64(len(buf))
+	hasher := sha256.New()
+	hasher.Write(buf)
 	hashHex := hex.EncodeToString(hasher.Sum(nil))
 	cat, isCore := classifyFile(fi.Name(), written)
 
+	var normSHA, structSHA string
+	if (isCore || cat == CategoryCode) && written <= 5*1024*1024 {
+		normRes := ComputeNormalizedCode(buf, fi.Name())
+		if normRes.MinCoreThreshold {
+			normSHA = normRes.NormalizedSHA256
+			structSHA = normRes.StructuralSHA256
+		}
+	}
+
 	return []*ArchivedFileInfo{
 		{
-			Path:       filepath.Base(absPath),
-			Filename:   filepath.Base(absPath),
-			Size:       written,
-			SHA256:     hashHex,
-			Category:   cat,
-			IsCoreCode: isCore,
+			Path:             filepath.Base(absPath),
+			Filename:         filepath.Base(absPath),
+			Size:             written,
+			SHA256:           hashHex,
+			NormalizedSHA256: normSHA,
+			StructuralSHA256: structSHA,
+			Category:         cat,
+			IsCoreCode:       isCore,
 		},
 	}, nil
 }
@@ -256,21 +297,25 @@ func ToDBFiles(files []*ArchivedFileInfo) []*db.SubmissionFile {
 	for _, f := range files {
 		isCode := (f.Category == CategoryCoreCode || f.Category == CategoryCode)
 		result = append(result, &db.SubmissionFile{
-			Filename:   f.Filename,
-			Filepath:   f.Path,
-			FileSize:   f.Size,
-			SHA256:     f.SHA256,
-			IsCode:     isCode,
-			IsCoreCode: f.IsCoreCode,
+			Filename:         f.Filename,
+			Filepath:         f.Path,
+			FileSize:         f.Size,
+			SHA256:           f.SHA256,
+			NormalizedSHA256: f.NormalizedSHA256,
+			StructuralSHA256: f.StructuralSHA256,
+			IsCode:           isCode,
+			IsCoreCode:       f.IsCoreCode,
 		})
 	}
 	return result
 }
 
 // CheckSubmissionPlagiarism verifies whether the uploaded submission duplicates with any existing submission.
-// It checks two tiers:
-// 1. Exact Archive Collision: The entire outer archive SHA256 is identical to another student's submission.
-// 2. Code File Collision: One or more core source implementation files (.c, .cpp, .cu, etc.) have identical SHA256 hashes.
+// It checks four tiers:
+// 1. Exact Archive Collision: The entire outer archive SHA256 is identical.
+// 2. Exact Code Collision: Core source files have identical SHA256 hashes.
+// 3. Normalized Code Collision: Comments stripped and formatting normalized.
+// 4. Structural Code Collision: Variables and identifiers canonicalized.
 func CheckSubmissionPlagiarism(
 	database *db.DB,
 	assignmentID string,
@@ -303,34 +348,41 @@ func CheckSubmissionPlagiarism(
 	}
 
 	// 2. Collect core implementation code files from the uploaded submission
-	var coreHashes []string
-	hashMap := make(map[string]string) // sha256 -> filename
+	var items []*db.CoreCodeItem
 	totalCore := 0
 
 	for _, f := range extractedFiles {
 		if f.IsCoreCode {
-			coreHashes = append(coreHashes, f.SHA256)
-			hashMap[f.SHA256] = f.Filename
+			items = append(items, &db.CoreCodeItem{
+				Filename:         f.Filename,
+				SHA256:           f.SHA256,
+				NormalizedSHA256: f.NormalizedSHA256,
+				StructuralSHA256: f.StructuralSHA256,
+			})
 			totalCore++
 		}
 	}
 
-	// If no core code found, also consider any code file
+	// If no core code found, also consider any code file >= 50 bytes
 	if totalCore == 0 {
 		for _, f := range extractedFiles {
 			if f.Category == CategoryCode && f.Size >= 50 {
-				coreHashes = append(coreHashes, f.SHA256)
-				hashMap[f.SHA256] = f.Filename
+				items = append(items, &db.CoreCodeItem{
+					Filename:         f.Filename,
+					SHA256:           f.SHA256,
+					NormalizedSHA256: f.NormalizedSHA256,
+					StructuralSHA256: f.StructuralSHA256,
+				})
 			}
 		}
 	}
 
-	if len(coreHashes) == 0 {
+	if len(items) == 0 {
 		return &PlagiarismCheckResult{IsDuplicate: false}, nil
 	}
 
 	// Check core code collisions against other students' latest submissions
-	collisions, err := database.FindCoreCodeCollisions(assignmentID, studentID, coreHashes)
+	collisions, err := database.FindCoreCodeCollisions(assignmentID, studentID, items)
 	if err != nil {
 		return nil, fmt.Errorf("verifier: check core code collision: %w", err)
 	}
@@ -346,6 +398,7 @@ func CheckSubmissionPlagiarism(
 		var topStudentID string
 		var topStudentName string
 		var topFiles []string
+		topCollisionType := "exact_code"
 		maxCount := 0
 
 		for sid, entries := range studentCollisions {
@@ -354,30 +407,53 @@ func CheckSubmissionPlagiarism(
 				topStudentID = sid
 				topStudentName = entries[0].MatchedStudentName
 				topFiles = nil
+				hasExact := false
+				hasNorm := false
 				for _, e := range entries {
-					origName := hashMap[e.SHA256]
+					origName := e.Filename
 					if origName == "" {
 						origName = e.OtherFilename
 					}
 					topFiles = append(topFiles, origName)
+					if e.CollisionType == "exact_code" {
+						hasExact = true
+					} else if e.CollisionType == "normalized_code" {
+						hasNorm = true
+					}
+				}
+				if hasExact {
+					topCollisionType = "exact_code"
+				} else if hasNorm {
+					topCollisionType = "normalized_code"
+				} else {
+					topCollisionType = "structural_code"
 				}
 			}
 		}
 
 		if maxCount >= 1 {
+			var msg string
+			switch topCollisionType {
+			case "exact_code":
+				msg = fmt.Sprintf("核心源代码文件 %v 与同学【%s】完全一致。严禁仅修改报告或文件名抄袭他人作业，请独立完成实验！", topFiles, topStudentName)
+			case "normalized_code":
+				msg = fmt.Sprintf("核心源代码文件 %v 与同学【%s】代码逻辑完全一致（仅修改了注释姓名或排版缩进）。严禁换壳抄袭，请独立完成实验！", topFiles, topStudentName)
+			case "structural_code":
+				msg = fmt.Sprintf("核心源代码文件 %v 与同学【%s】语法结构与算法 100%% 雷同（仅重命名了变量名或函数名）。严禁抄袭他人代码，请独立完成实验！", topFiles, topStudentName)
+			default:
+				msg = fmt.Sprintf("核心源代码文件 %v 与同学【%s】高度雷同。严禁抄袭他人作业，请独立完成实验！", topFiles, topStudentName)
+			}
+
 			return &PlagiarismCheckResult{
 				IsDuplicate:        true,
-				DuplicateType:      "code_collision",
+				DuplicateType:      topCollisionType,
 				MatchedStudentID:   topStudentID,
 				MatchedStudentName: topStudentName,
 				MatchedAssignment:  assignmentID,
 				IdenticalFiles:     topFiles,
 				TotalCoreFiles:     totalCore,
 				CollidedCoreFiles:  maxCount,
-				Message: fmt.Sprintf(
-					"核心源代码文件 %v 的 SHA256 哈希与同学【%s】完全一致。严禁仅修改报告或文件名抄袭他人作业，请独立完成实验！",
-					topFiles, topStudentName,
-				),
+				Message:            msg,
 			}, nil
 		}
 	}
