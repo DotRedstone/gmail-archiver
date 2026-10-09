@@ -1403,7 +1403,30 @@ class HomeworkPlugin(Star):
             event.stop_event()
             return
 
-        clean_text = text.strip()
+        # 4. 规范消息文本，剥离群聊中的 @机器人 前缀或 At 组件文本
+        raw_text = text.strip()
+        clean_text = re.sub(r"@\S+(?:\s*[\(（]\d+[\)）])?\s*", "", raw_text).strip()
+        clean_text = re.sub(r"\[At:\d+\]\s*", "", clean_text).strip()
+        if not clean_text:
+            clean_text = raw_text
+
+        # 4.1 自然语言姓名查收（例如：孙逸腾作业交了吗 / 孙逸腾交了没 / 查一下孙逸腾 / 查孙逸腾）
+        target_name_match = None
+        if not re.search(r"[我]|本人", clean_text):
+            m1 = re.search(r"^([\u4e00-\u9fa5]{2,4})(?:同学)?(?:的)?(?:作业)?(?:交了吗|交了没|交了没有|交没交|收到了吗|收到没|交了嘛|交没)$", clean_text)
+            if m1:
+                target_name_match = m1.group(1)
+            else:
+                m2 = re.search(r"^(?:查一下|查查|帮我查|看看|看下|查)\s*([\u4e00-\u9fa5]{2,4})$", clean_text)
+                if m2:
+                    target_name_match = m2.group(1)
+
+        if target_name_match and target_name_match not in ["作业", "谁", "大家", "同学", "全部", "所有", "实验", "看看", "查查", "看下", "帮我", "一下"]:
+            event.stop_event()
+            async for r in self.check_student(event, target_name_match):
+                await reply(r)
+            return
+
         if clean_text in ["查作业", "作业统计", "作业概览", "查看作业", "作业进度", "全部作业"]:
             event.stop_event()
             async for r in self.status_cmd(event):
