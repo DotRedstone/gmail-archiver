@@ -166,13 +166,13 @@ ASSISTANT_SYSTEM_PROMPT = """你是一个可靠、自然的 QQ 智能助手。�
 - 只有私聊且完成花名册核验的用户，才可通过 get_my_verified_identity 查询其自己的绑定身份；用户问“我是谁”“我的信息”时应调用该工具。
 - 群聊中不得推断、展示或确认任何人的学号、姓名、绑定状态或作业信息；即使有人问“我是谁”，也只能说明你无法在群里核验身份，并提示其私聊完成绑定后查询。
 - 普通学生只能查询本人；不得用任何工具向其披露他人的身份、作业或绑定信息。
-- 管理员私聊请求班级绑定名单或未绑定名单时，调用 send_course_roster 或 send_unbound_roster；工具会直接私密发送结果，不能在模型回复中复述名单。
+- 管理员私聊请求班级绑定名单、未绑定名单或教学管理团队（例如“谁是助教”“助教名单”“管理员有哪些人”）时，分别调用 send_course_roster、send_unbound_roster 或 send_teaching_team；这些工具会直接私密发送结果，不能在模型回复中复述名单。
 
 【回复风格】
 - 自然、友好、简洁，直接回答问题；不知道就坦诚说明。
 - 不捏造人设、姓名、身份或与用户的既往关系。"""
 
-@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.6.1")
+@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.6.4")
 class HomeworkPlugin(Star):
     def __init__(self, context):
         super().__init__(context)
@@ -372,6 +372,51 @@ class HomeworkPlugin(Star):
             return "暂时无法读取未绑定名单，请稍后重试。"
         await event.send(make_reply(event, render_unbound_students_card(roster_data, bindings_data, class_name.strip())))
         return "已通过私聊发送未绑定名单。不要在回复中复述名单内容。"
+
+    async def _render_teaching_team_card(self) -> str:
+        """Build the staff roster only after the caller's privilege is checked."""
+        tas = get_teaching_assistants()
+        lines = [
+            "👥【课程教学管理团队】",
+            "━━━━━━━━━━━━━━━",
+            f"👑 超级管理员：QQ {SUPER_ADMIN_QQ}",
+        ]
+        if tas:
+            lines.append("🎓 课程助教：")
+            for idx, qq_id in enumerate(tas, 1):
+                name_info = ""
+                try:
+                    binding = await async_api_get(f"/api/bindings/{qq_id}")
+                    if not binding.get("error"):
+                        name = str(binding.get("student_name", "")).strip()
+                        class_name = format_class_name(
+                            str(binding.get("class_name", "")),
+                            str(binding.get("student_id", "")),
+                        )
+                        if name:
+                            name_info = f" - {name}（{class_name}）"
+                except Exception:
+                    # A failed name lookup must not hide the configured role.
+                    pass
+                lines.append(f"  {idx}. QQ {qq_id}{name_info}")
+        else:
+            lines.append("🎓 课程助教：暂未配置")
+        lines.append("━━━━━━━━━━━━━━━")
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="send_teaching_team")
+    async def tool_send_teaching_team(self, event: AstrMessageEvent) -> str:
+        '''向有权限的管理员私聊发送教学管理团队名单。
+
+        用户问“谁是助教”“助教名单”“教学团队”“管理员有哪些人”时调用。
+        名单包含课程角色和已配置成员，仅限课程助教或管理员私聊查看。
+        '''
+        if not event.is_private_chat():
+            return "隐私保护：教学管理团队名单不能在群里发送。请让课程助教或管理员私聊机器人查询。"
+        if not is_ta_or_admin(event):
+            return "权限不足：教学管理团队名单仅限课程助教或管理员私聊查看。"
+        await event.send(make_reply(event, await self._render_teaching_team_card()))
+        return "已通过私聊发送教学管理团队名单。不要在回复中复述名单内容。"
 
     @filter.llm_tool(name="query_student_homework")
     async def tool_query_student(self, event: AstrMessageEvent, student_name_or_id: str) -> str:
@@ -952,27 +997,7 @@ class HomeworkPlugin(Star):
         if not is_ta_or_admin(event):
             yield make_reply(event, "❌ 权限不足：仅助教或管理员可查看助教名单。")
             return
-        tas = get_teaching_assistants()
-        lines = [
-            "👥【并行计算课程 · 教学管理团队】",
-            "━━━━━━━━━━━━━━━",
-            f"👑 超级管理员：QQ {SUPER_ADMIN_QQ}",
-        ]
-        if tas:
-            lines.append("🎓 课程助教：")
-            for idx, q in enumerate(tas, 1):
-                name_str = ""
-                try:
-                    b = await async_api_get(f"/api/bindings/{q}")
-                    if not b.get("error"):
-                        name_str = f" - {b.get('student_name', '')}（{b.get('class_name', '')}）"
-                except Exception:
-                    pass
-                lines.append(f"  {idx}. QQ {q}{name_str}")
-        else:
-            lines.append("🎓 课程助教：（暂未配置，管理员可发送 /添加助教 <QQ> 添加）")
-        lines.append("━━━━━━━━━━━━━━━")
-        yield make_reply(event, "\n".join(lines))
+        yield make_reply(event, await self._render_teaching_team_card())
 
     # [Status & Missing Commands]
     @filter.command("查作业")
@@ -1801,6 +1826,12 @@ class HomeworkPlugin(Star):
         if text.isdigit() and session_info:
             await reply(f"⚠️ 未找到序号 [{text}] 对应的作业选项，请回复有效序号，或回复 取消 退出。")
             event.stop_event()
+            return
+
+        # Natural language belongs to the LLM agent.  This legacy listener is
+        # retained only for explicit slash commands; upload and confirmation
+        # flows above have already been handled before reaching this point.
+        if not text.lstrip().startswith("/"):
             return
 
         # 4. 规范消息文本，剥离群聊中的 @机器人 前缀或 At 组件文本
