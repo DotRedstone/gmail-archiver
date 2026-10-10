@@ -134,6 +134,15 @@ def _is_bot_mentioned(event: AstrMessageEvent) -> bool:
     return False
 
 
+def _parse_student_identity(text: str) -> tuple[str, str]:
+    """Parse the explicit ``学号 姓名`` reply used by legacy pending flows."""
+    student_id = extract_student_id(text)
+    if not student_id:
+        return "", ""
+    student_name = text.replace(student_id, "", 1).strip(" ，,：:")
+    return student_id, student_name
+
+
 def _looks_like_provider_error(text: str) -> bool:
     """Never send a raw JSON payload from an upstream provider to a student."""
     stripped = (text or "").strip()
@@ -1500,9 +1509,9 @@ class HomeworkPlugin(Star):
                 return
 
         if s_type == "bind_and_submit":
-            sid = extract_student_id(text)
-            if not sid:
-                await reply("⚠️ 未识别到有效学号。请直接回复 12 位学号（例如：240809010501），回复 取消 可退出本次提交。")
+            sid, student_name = _parse_student_identity(text)
+            if not sid or not student_name:
+                await reply("⚠️ 为核验身份，请回复“学号 姓名”（例如：240809010501 张三），回复 取消 可退出本次提交。")
                 event.stop_event()
                 return
 
@@ -1511,7 +1520,7 @@ class HomeworkPlugin(Star):
 
             await reply(f"⏳ 正在核对学号【{sid}】并绑定归档作业...")
 
-            bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
+            bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid, "student_name": student_name})
             if not bind_res.get("success"):
                 err = bind_res.get("error", "学号核验失败")
                 await reply(f"❌ 绑定失败：{err}\n请核对学号后重新发送作业文件。")
@@ -1587,16 +1596,16 @@ class HomeworkPlugin(Star):
             return
 
         if s_type == "bind_and_chat":
-            sid = extract_student_id(text)
-            if not sid:
-                await reply("⚠️ 未识别到有效学号。请直接回复 12 位学号（例如：240809010501），回复 取消 退出。")
+            sid, student_name = _parse_student_identity(text)
+            if not sid or not student_name:
+                await reply("⚠️ 为核验身份，请回复“学号 姓名”（例如：240809010501 张三），回复 取消 退出。")
                 event.stop_event()
                 return
 
             del PENDING_SESSIONS[session_key]
             event.stop_event()
 
-            bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
+            bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid, "student_name": student_name})
             if not bind_res.get("success"):
                 err = bind_res.get("error", "学号核验失败")
                 await reply(f"❌ 绑定失败：{err}\n请核对学号后重新发送。")
@@ -1618,9 +1627,9 @@ class HomeworkPlugin(Star):
             return
 
         if s_type == "bind_and_report_status":
-            sid = extract_student_id(text)
-            if not sid:
-                await reply("⚠️ 未识别到有效学号。请直接回复 12 位学号（例如：240809010501），回复 取消 退出。")
+            sid, student_name = _parse_student_identity(text)
+            if not sid or not student_name:
+                await reply("⚠️ 为核验身份，请回复“学号 姓名”（例如：240809010501 张三），回复 取消 退出。")
                 event.stop_event()
                 return
 
@@ -1629,7 +1638,7 @@ class HomeworkPlugin(Star):
 
             await reply(f"⏳ 正在核对学号【{sid}】并查询作业状态...")
 
-            bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
+            bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid, "student_name": student_name})
             if not bind_res.get("success"):
                 err = bind_res.get("error", "学号核验失败")
                 await reply(f"❌ 绑定失败：{err}\n请核对学号是否在花名册中。")
