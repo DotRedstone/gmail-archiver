@@ -6,6 +6,7 @@ import sys
 import time
 
 from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event.filter import CustomFilter
 from astrbot.api.star import register, Star
 from astrbot.api.provider import ProviderRequest, LLMResponse
 from astrbot.api.message_components import File
@@ -117,6 +118,13 @@ FALLBACK_REPLY = (
 )
 
 
+class ExplicitSlashCommand(CustomFilter):
+    """Keep deterministic command skills out of ordinary LLM conversation."""
+
+    def filter(self, event: AstrMessageEvent, cfg) -> bool:
+        return event.get_message_str().lstrip().startswith("/")
+
+
 def _is_bound_class_group(event: AstrMessageEvent) -> bool:
     return str(event.get_group_id() or "") in {str(g) for g in get_class_groups()}
 
@@ -152,7 +160,7 @@ def _looks_like_provider_error(text: str) -> bool:
 
 ASSISTANT_SYSTEM_PROMPT = """你是一个可靠、自然的 QQ 智能助手。默认用中文交流，正常回答问候、日常问题、学习讨论和课程相关问题；不要把每句话都引回作业或重复功能说明。
 
-你也可以使用课程作业技能：私聊上传压缩包、身份绑定、作业状态查询、导出、查重和课程管理。需要实时课程数据时，优先调用已注册工具；不要猜测提交记录、截止时间或身份信息。
+你也可以使用课程作业技能：私聊上传压缩包、身份绑定、作业状态查询、导出、查重和课程管理。询问全班提交进度时调用 get_course_submission_status；需要实时课程数据时，优先调用已注册工具；不要猜测提交记录、截止时间或身份信息。
 
 【身份与隐私】
 - 只有私聊且完成花名册核验的用户，才可通过 get_my_verified_identity 查询其自己的绑定身份；用户问“我是谁”“我的信息”时应调用该工具。
@@ -185,13 +193,6 @@ class HomeworkPlugin(Star):
         except Exception:
             # Alerts must never affect normal message processing.
             pass
-
-    async def _fallback(self, event: AstrMessageEvent, reason: str, text: str = FALLBACK_REPLY) -> None:
-        sender_id = str(event.get_sender_id() or "")
-        group_id = str(event.get_group_id() or "")
-        record_event(sender_id, group_id, "private" if event.is_private_chat() else "group", "regex", reason)
-        event.stop_event()
-        await event.send(make_reply(event, text))
 
     # [Guardrails]
     @filter.on_llm_request()
@@ -255,7 +256,8 @@ class HomeworkPlugin(Star):
                 f"rate:{sender_id}",
                 f"QQ {sender_id} 在 1 分钟内触发了模型限流（群：{group_id or '私聊'}）。",
             )
-            await self._fallback(event, "per_minute")
+            event.stop_event()
+            await event.send(make_reply(event, "⏳ 当前提问过于频繁，请稍后再试。"))
             return
 
         projected_daily_count = daily_llm_count(sender_id) + 1
@@ -409,8 +411,45 @@ class HomeworkPlugin(Star):
             lines.append(f"{idx}. {a['name']} (ID: {a['id']})，截止时间：{dl}，应交人数：{a.get('total_expected', 0)} 人")
         return "\n".join(lines)
 
+    @filter.llm_tool(name="get_course_submission_status")
+    async def tool_get_course_submission_status(self, event: AstrMessageEvent, assignment_hint: str = "") -> str:
+        '''获取课程作业总体提交进度。用户询问“作业交了多少”“提交率”“作业进度”时调用。
+
+        Args:
+            assignment_hint(string): 用户提及的作业名称、编号或空字符串（查询全部概览）
+        '''
+        assignments = get_assignments()
+        if not assignments:
+            return "当前未能获取到已发布的作业。"
+
+        hint = assignment_hint.strip()
+        if hint:
+            target = match_assignment(hint, assignments)
+            if not target:
+                names = "、".join(a["name"] for a in assignments)
+                return f"未找到与“{hint}”匹配的作业。当前可用作业：{names}。"
+            targets = [target]
+        else:
+            targets = assignments
+
+        lines = []
+        for assignment in targets:
+            try:
+                status = api_get(f"/api/assignments/{assignment['id']}/status")
+            except Exception:
+                lines.append(f"{assignment['name']}：暂时无法获取提交进度。")
+                continue
+            deadline = format_beijing_time(status.get("deadline", ""))
+            lines.append(
+                f"{assignment['name']}：已交 {status.get('submitted_count', 0)}/"
+                f"{status.get('total_expected', 0)}，提交率 {status.get('submission_rate', '未知')}，"
+                f"迟交 {status.get('late_count', 0)}，截止时间 {deadline}。"
+            )
+        return "\n".join(lines)
+
     # [Help]
     @filter.command("帮助", alias={"作业帮助"})
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def help_cmd(self, event: AstrMessageEvent):
         msg = (
             "📖【并行计算课程 · 作业助手指南】\n"
@@ -441,6 +480,7 @@ class HomeworkPlugin(Star):
         yield make_reply(event, msg)
 
     @filter.command("会话统计", alias={"每日会话", "会话情况"})
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def conversation_stats_cmd(self, event: AstrMessageEvent, param: str = ""):
         """Owner-only operational view; it contains no message text or student PII."""
         if not is_super_admin(event):
@@ -482,6 +522,7 @@ class HomeworkPlugin(Star):
 
     # [Binding Commands]
     @filter.command("指定绑定", alias={"代绑", "代绑定"})
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def assign_bind_student(self, event: AstrMessageEvent, param: str = ""):
         """助教专属：直接指定任意 QQ 号与学生身份绑定"""
         if not is_ta_or_admin(event):
@@ -509,6 +550,7 @@ class HomeworkPlugin(Star):
             yield r
 
     @filter.command("绑定")
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def bind_student(self, event: AstrMessageEvent, param: str = ""):
         sender_id = str(event.get_sender_id())
         parts = param.strip().split()
@@ -612,6 +654,7 @@ class HomeworkPlugin(Star):
             )
 
     @filter.command("我的信息", alias={"查询绑定", "我的绑定"})
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def my_info(self, event: AstrMessageEvent):
         sender_id = str(event.get_sender_id())
         try:
@@ -640,6 +683,7 @@ class HomeworkPlugin(Star):
         )
 
     @filter.command("解绑")
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def unbind_student(self, event: AstrMessageEvent, param: str = ""):
         # 想解绑只能助教有权限解绑
         if not is_ta_or_admin(event):
@@ -723,6 +767,7 @@ class HomeworkPlugin(Star):
             yield make_reply(event, f"⚠️ 解绑失败：{del_resp.get('error', '未知错误')}")
 
     @filter.command("班级人员", alias={"班级人员列表", "人员列表", "绑定列表", "已绑定列表", "绑定名单", "已绑定名单", "班级名单", "学生列表"})
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def class_members_cmd(self, event: AstrMessageEvent, param: str = ""):
         """查看全班已绑定 QQ 的学生列表（按班级分组）：/班级人员 [班级名]"""
         if not is_ta_or_admin(event):
@@ -744,6 +789,7 @@ class HomeworkPlugin(Star):
         yield make_reply(event, card)
 
     @filter.command("未绑定", alias={"未绑定名单", "未绑定人员", "未绑定学生", "谁没绑定"})
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def unbound_members_cmd(self, event: AstrMessageEvent, param: str = ""):
         """查看全班尚未绑定 QQ 的学生催交名单：/未绑定 [班级名]"""
         if not is_ta_or_admin(event):
@@ -765,12 +811,14 @@ class HomeworkPlugin(Star):
         yield make_reply(event, card)
 
     @filter.command("绑定列表")
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def list_bindings_cmd(self, event: AstrMessageEvent, param: str = ""):
         async for r in self.class_members_cmd(event, param):
             yield r
 
     # [Class Group Commands]
     @filter.command("设为班级群")
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def set_class_group_cmd(self, event: AstrMessageEvent):
         if not is_admin(event):
             yield make_reply(event, "❌ 权限不足：仅助教或管理员可配置班级群。")
@@ -787,6 +835,7 @@ class HomeworkPlugin(Star):
             yield make_reply(event, f"ℹ️ 当前群【{group_id}】已在通告群列表中。")
 
     @filter.command("移除班级群")
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def remove_class_group_cmd(self, event: AstrMessageEvent):
         if not is_admin(event):
             yield make_reply(event, "❌ 权限不足。")
@@ -803,6 +852,7 @@ class HomeworkPlugin(Star):
             yield make_reply(event, f"ℹ️ 当前群【{group_id}】不在班级群列表中。")
 
     @filter.command("班级群列表")
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def list_class_groups_cmd(self, event: AstrMessageEvent):
         if not is_admin(event):
             yield make_reply(event, "❌ 权限不足。")
@@ -817,6 +867,7 @@ class HomeworkPlugin(Star):
 
     # [TA Management Commands]
     @filter.command("添加助教")
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def add_ta_cmd(self, event: AstrMessageEvent, qq: str = ""):
         if not is_super_admin(event):
             yield make_reply(event, "❌ 权限不足：仅超级管理员可任命助教。")
@@ -843,6 +894,7 @@ class HomeworkPlugin(Star):
             yield make_reply(event, f"ℹ️ QQ {qq} 已在助教列表中。")
 
     @filter.command("移除助教")
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def remove_ta_cmd(self, event: AstrMessageEvent, qq: str = ""):
         if not is_super_admin(event):
             yield make_reply(event, "❌ 权限不足：仅超级管理员可移除助教。")
@@ -857,6 +909,7 @@ class HomeworkPlugin(Star):
             yield make_reply(event, f"⚠️ 未在助教列表中找到 QQ {qq}。")
 
     @filter.command("助教列表")
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def list_ta_cmd(self, event: AstrMessageEvent):
         if not is_ta_or_admin(event):
             yield make_reply(event, "❌ 权限不足：仅助教或管理员可查看助教名单。")
@@ -885,6 +938,7 @@ class HomeworkPlugin(Star):
 
     # [Status & Missing Commands]
     @filter.command("查作业")
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def status_cmd(self, event: AstrMessageEvent, param: str = ""):
         assignments = get_assignments()
         if not assignments:
@@ -939,6 +993,7 @@ class HomeworkPlugin(Star):
         yield make_reply(event, "\n".join(lines))
 
     @filter.command("未交")
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def missing_cmd(self, event: AstrMessageEvent, param: str = ""):
         assignments = get_assignments()
         if not assignments:
@@ -987,6 +1042,7 @@ class HomeworkPlugin(Star):
         yield make_reply(event, "\n".join(lines))
 
     @filter.command("查收")
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def check_student(self, event: AstrMessageEvent, query: str = ""):
         query = query.strip()
         sender_id = str(event.get_sender_id())
@@ -1128,6 +1184,7 @@ class HomeworkPlugin(Star):
 
     # [Export Commands]
     @filter.command("导出作业", alias={"下载作业"})
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def export_cmd(self, event: AstrMessageEvent, param: str = ""):
         if not is_admin(event):
             yield make_reply(event, "❌ 权限不足：作业归档导出仅限课程助教或管理员执行。")
@@ -1185,6 +1242,7 @@ class HomeworkPlugin(Star):
         yield make_reply(event, "\n".join(menu_lines))
 
     @filter.command("导出整学期", alias={"导出全部作业"})
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def export_all_direct_cmd(self, event: AstrMessageEvent):
         if not is_admin(event):
             yield make_reply(event, "❌ 权限不足：整学期归档导出仅限课程助教或管理员执行。")
@@ -1197,6 +1255,7 @@ class HomeworkPlugin(Star):
 
     # [Plagiarism Commands]
     @filter.command("查重", alias={"代码查重", "学术诚信", "一键查重", "查抄袭"})
+    @filter.custom_filter(ExplicitSlashCommand, False)
     async def plagiarism_cmd(self, event: AstrMessageEvent, param: str = ""):
         if not is_ta_or_admin(event):
             yield make_reply(event, "❌ 权限不足：代码查重仅限课程助教或管理员执行。")
