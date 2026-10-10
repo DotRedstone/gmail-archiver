@@ -1,5 +1,5 @@
 name: astrbot_plugin_gmail_homework
 desc: 课程作业全流程助手：QQ 私聊直收作业归档、学生身份绑定、实验卡一键分发、催交与查询
 author: DotRedstone
-version: 1.6.0
+version: 1.6.1
 repo: "https://github.com/DotRedstone/gmail-archiver"

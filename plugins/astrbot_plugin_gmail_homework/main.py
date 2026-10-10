@@ -150,19 +150,20 @@ def _looks_like_provider_error(text: str) -> bool:
         return True
     return stripped.startswith("{") or stripped.startswith("[")
 
-HOMEWORK_SYSTEM_PROMPT = """你是《并行计算》课程作业助手。
-【核心职责】：
-1. 专注于课程作业的发布指引、提交收集与状态核验。
-2. 作业提交方式：指导学生直接私聊发送作业压缩包（.zip / .rar / .7z / .tar.gz），系统将自动核验并归档入库。
-3. 作业状态查询：指导学生使用「/查收 姓名」或直接回复「看看我交了吗」自助查询。
-4. 解答学生关于实验要求、打包格式、命名规范及作业提交相关的疑问。
-5. 对需要实时作业数据的问题，优先调用已注册的查询工具；不要臆造提交记录或截止时间。
-6. 确定性指令（绑定、上传、导出、权限管理）是本助手的技能入口，可在需要时指导用户使用相应指令。
-【回复规范】：
-- 语言风格：专业、简洁、直接、客观，严禁任何角色扮演、拟人化动作描写或冗余套话。
-- 若学生输入完全无关的话题，简明礼貌回复：“同学你好，本助手主要负责课程作业收集与查收指引，如需交作业请直接私聊发送作业压缩包。”"""
+ASSISTANT_SYSTEM_PROMPT = """你是一个可靠、自然的 QQ 智能助手。默认用中文交流，正常回答问候、日常问题、学习讨论和课程相关问题；不要把每句话都引回作业或重复功能说明。
 
-@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.6.0")
+你也可以使用课程作业技能：私聊上传压缩包、身份绑定、作业状态查询、导出、查重和课程管理。需要实时课程数据时，优先调用已注册工具；不要猜测提交记录、截止时间或身份信息。
+
+【身份与隐私】
+- 只有私聊且完成花名册核验的用户，才可通过 get_my_verified_identity 查询其自己的绑定身份；用户问“我是谁”“我的信息”时应调用该工具。
+- 群聊中不得推断、展示或确认任何人的学号、姓名、绑定状态或作业信息；即使有人问“我是谁”，也只能说明你无法在群里核验身份，并提示其私聊完成绑定后查询。
+- 普通学生只能查询本人；不得用任何工具向其披露他人的身份、作业或绑定信息。
+
+【回复风格】
+- 自然、友好、简洁，直接回答问题；不知道就坦诚说明。
+- 不捏造人设、姓名、身份或与用户的既往关系。"""
+
+@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.6.1")
 class HomeworkPlugin(Star):
     def __init__(self, context):
         super().__init__(context)
@@ -270,20 +271,16 @@ class HomeworkPlugin(Star):
         USER_QUERY_TIMESTAMPS[sender_id] = history
         record_event(sender_id, group_id, scope, "llm")
 
-        student_ctx = ""
+        student_ctx = "\n\n【当前会话】：课程群聊。不要在群里调用或泄露任何个人身份信息。"
         if is_private:
             try:
                 b_info = await async_api_get(f"/api/bindings/{sender_id}")
             except Exception:
                 b_info = {}
             if not b_info.get("error"):
-                student_ctx = (
-                    "\n\n【隐私规则】：当前私聊用户已完成花名册身份核验。"
-                    "若其询问自己的作业状态，调用 query_student_homework('我自己')；"
-                    "不得向其披露其他学生的身份、作业或绑定信息。"
-                )
+                student_ctx = "\n\n【当前会话】：私聊且该用户已完成花名册身份核验。"
 
-        full_prompt = HOMEWORK_SYSTEM_PROMPT + student_ctx
+        full_prompt = ASSISTANT_SYSTEM_PROMPT + student_ctx
         req.system_prompt = full_prompt
 
     @filter.on_llm_response()
@@ -317,6 +314,25 @@ class HomeworkPlugin(Star):
         )
 
     # [LLM Tools]
+    @filter.llm_tool(name="get_my_verified_identity")
+    async def tool_get_my_verified_identity(self, event: AstrMessageEvent) -> str:
+        '''查询当前私聊用户经花名册核验后的本人身份。仅在用户询问“我是谁”或“我的信息”时调用。'''
+        if not event.is_private_chat():
+            return "隐私保护：群聊中不能查询或确认任何人的身份信息。请提醒用户私聊机器人后查询。"
+
+        sender_id = str(event.get_sender_id() or "")
+        try:
+            binding = await async_api_get(f"/api/bindings/{sender_id}")
+        except Exception:
+            return "暂时无法核验当前绑定身份，请稍后重试。"
+        if binding.get("error"):
+            return "当前账号尚未完成身份绑定。请发送 /绑定 学号 姓名，核验成功后再查询。"
+
+        name = str(binding.get("student_name", "")).strip()
+        student_id = str(binding.get("student_id", "")).strip()
+        class_name = format_class_name(str(binding.get("class_name", "")), student_id)
+        return f"当前私聊账号的已验证身份：姓名 {name}，学号 {student_id}，班级 {class_name}。"
+
     @filter.llm_tool(name="query_student_homework")
     async def tool_query_student(self, event: AstrMessageEvent, student_name_or_id: str) -> str:
         '''查询指定学生在各次作业中的提交与归档状态。
