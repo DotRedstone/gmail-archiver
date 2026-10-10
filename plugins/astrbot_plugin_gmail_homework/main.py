@@ -7,8 +7,9 @@ import time
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import register, Star
-from astrbot.api.provider import ProviderRequest
+from astrbot.api.provider import ProviderRequest, LLMResponse
 from astrbot.api.message_components import File
+from astrbot.core.message.message_event_result import MessageChain
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 if _PLUGIN_DIR not in sys.path:
@@ -27,6 +28,7 @@ try:
         is_super_admin,
         is_ta_or_admin,
         is_admin,
+        get_conversation_policy,
     )
     from .client import (
         api_get,
@@ -34,6 +36,7 @@ try:
         async_api_post_json,
         async_api_delete,
         async_upload_file,
+        authenticated_download_url,
         get_assignments,
         match_assignment,
     )
@@ -54,6 +57,7 @@ try:
         render_unbound_students_card,
     )
     from .actions import make_reply, upload_file_action
+    from .conversation_policy import claim_alert, daily_llm_count, daily_summary, record_event
 except ImportError:
     from config import (
         API_BASE,
@@ -67,6 +71,7 @@ except ImportError:
         is_super_admin,
         is_ta_or_admin,
         is_admin,
+        get_conversation_policy,
     )
     from client import (
         api_get,
@@ -74,6 +79,7 @@ except ImportError:
         async_api_post_json,
         async_api_delete,
         async_upload_file,
+        authenticated_download_url,
         get_assignments,
         match_assignment,
     )
@@ -94,6 +100,7 @@ except ImportError:
         render_unbound_students_card,
     )
     from actions import make_reply, upload_file_action
+    from conversation_policy import claim_alert, daily_llm_count, daily_summary, record_event
 
 # [State]
 PENDING_SESSIONS = {}
@@ -103,6 +110,36 @@ USER_QUERY_TIMESTAMPS = {}
 MAX_USER_QUERIES_PER_MINUTE = 6
 USER_QUERY_COOLDOWN_SECONDS = 3.0
 MAX_PROMPT_CHARS = 1500
+
+FALLBACK_REPLY = (
+    "当前智能问答暂不可用，已切换为作业助手模式。\n"
+    "可直接使用：/绑定 学号 姓名、/查收、/查作业、/未交、/帮助。"
+)
+
+
+def _is_bound_class_group(event: AstrMessageEvent) -> bool:
+    return str(event.get_group_id() or "") in {str(g) for g in get_class_groups()}
+
+
+def _is_bot_mentioned(event: AstrMessageEvent) -> bool:
+    """Only accept an actual mention of this bot, never a mention of another member."""
+    if bool(getattr(event, "is_at_or_wake_command", False)):
+        return True
+    self_id = str(event.get_self_id() or "")
+    if not self_id:
+        return False
+    for component in event.get_messages() or []:
+        if str(getattr(component, "qq", "")) == self_id:
+            return True
+    return False
+
+
+def _looks_like_provider_error(text: str) -> bool:
+    """Never send a raw JSON payload from an upstream provider to a student."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    return stripped.startswith("{") or stripped.startswith("[")
 
 HOMEWORK_SYSTEM_PROMPT = """你是《并行计算》课程作业助手。
 【核心职责】：
@@ -114,99 +151,161 @@ HOMEWORK_SYSTEM_PROMPT = """你是《并行计算》课程作业助手。
 - 语言风格：专业、简洁、直接、客观，严禁任何角色扮演、拟人化动作描写或冗余套话。
 - 若学生输入完全无关的话题，简明礼貌回复：“同学你好，本助手主要负责课程作业收集与查收指引，如需交作业请直接私聊发送作业压缩包。”"""
 
-@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.4.3")
+@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.5.0")
 class HomeworkPlugin(Star):
     def __init__(self, context):
         super().__init__(context)
 
+    async def _notify_admin(self, event: AstrMessageEvent, alert_key: str, message: str) -> None:
+        """Send a rate-limited operational alert without exposing student content."""
+        policy = get_conversation_policy()
+        if not claim_alert(alert_key, policy["alert_cooldown_seconds"]):
+            return
+        bot = getattr(event, "bot", None)
+        if not bot:
+            return
+        try:
+            await bot.call_action(
+                "send_private_msg",
+                user_id=SUPER_ADMIN_QQ,
+                message=f"⚠️【作业助手告警】\n{message}",
+            )
+        except Exception:
+            # Alerts must never affect normal message processing.
+            pass
+
+    async def _fallback(self, event: AstrMessageEvent, reason: str, text: str = FALLBACK_REPLY) -> None:
+        sender_id = str(event.get_sender_id() or "")
+        group_id = str(event.get_group_id() or "")
+        record_event(sender_id, group_id, "private" if event.is_private_chat() else "group", "regex", reason)
+        event.stop_event()
+        await event.send(make_reply(event, text))
+
     # [Guardrails]
     @filter.on_llm_request()
     async def handle_llm_guardrails(self, event: AstrMessageEvent, req: ProviderRequest):
-        if not event.is_private_chat() and not is_admin(event):
+        sender_id = str(event.get_sender_id() or "")
+        group_id = str(event.get_group_id() or "")
+        is_private = event.is_private_chat()
+        scope = "private" if is_private else "group"
+        msg_text = event.get_message_str().strip()
+
+        # LLM access in groups is intentionally narrow: only configured course
+        # groups and only an explicit mention of this bot. Commands are handled
+        # by the listener before this hook and remain available as before.
+        if not is_private and (not _is_bound_class_group(event) or not _is_bot_mentioned(event)):
+            record_event(sender_id, group_id, scope, "group_blocked", "not_bound_or_not_mentioned")
             event.stop_event()
-            await event.send(make_reply(event,
-                "同学你好！群聊中仅支持作业指令查询（/查作业、/未交、/查收、/帮助）。\n"
-                "为了保持群内消息整洁并保护你的提问隐私，代码调试与学术疑问请直接【私聊我】提问哦~"
-            ))
             return
 
-        if event.is_private_chat() and not is_admin(event):
-            msg_text = event.get_message_str().strip()
-            sender_id = str(event.get_sender_id())
-
+        if is_private and not is_admin(event):
             try:
                 bind_data = await async_api_get(f"/api/bindings/{sender_id}")
             except Exception:
                 bind_data = {}
 
             if bind_data.get("error"):
-                sid = extract_student_id(msg_text)
-                if sid:
-                    try:
-                        auto_bind = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
-                        if auto_bind.get("success"):
-                            bind_data = auto_bind.get("binding", {})
-                    except Exception:
-                        pass
-
-            if bind_data.get("error") and not msg_text.startswith("/") and not msg_text.startswith("!"):
+                record_event(sender_id, group_id, scope, "unbound_blocked", "identity_required")
                 event.stop_event()
-                session_key = (sender_id, "")
-                PENDING_SESSIONS[session_key] = {
-                    "time": time.time(),
-                    "type": "bind_and_chat",
-                    "question": msg_text,
-                }
                 await event.send(make_reply(event,
-                    "👋 同学你好！欢迎使用《并行计算》作业助手。\n"
-                    "首次使用请直接回复你的【学号】（例如：240809010501）完成身份绑定，绑定后可直接私聊发送作业压缩包秒级归档提交。"
+                    "👋 首次私聊请先完成实名绑定，未绑定身份不会转入智能问答。\n"
+                    "请发送：/绑定 学号 姓名\n"
+                    "例如：/绑定 240809010501 张三\n"
+                    "系统会通过课程花名册核验后再开放私聊功能。"
                 ))
                 return
 
-            if len(msg_text) > MAX_PROMPT_CHARS:
-                event.stop_event()
-                await event.send(make_reply(event,
-                    f"⚠️ 单次提问内容过长（超过 {MAX_PROMPT_CHARS} 字）。\n"
-                    "请提炼核心代码报错或关键问题分段发送哦~"
-                ))
-                return
+        if len(msg_text) > MAX_PROMPT_CHARS:
+            record_event(sender_id, group_id, scope, "regex", "prompt_too_long")
+            event.stop_event()
+            await event.send(make_reply(event,
+                f"⚠️ 单次提问内容过长（超过 {MAX_PROMPT_CHARS} 字）。\n"
+                "请提炼核心代码报错或关键问题分段发送哦~"
+            ))
+            return
 
-            sender_id = str(event.get_sender_id())
-            now = time.time()
-            history = USER_QUERY_TIMESTAMPS.get(sender_id, [])
-            history = [t for t in history if now - t < 60]
+        now = time.time()
+        history = USER_QUERY_TIMESTAMPS.get(sender_id, [])
+        history = [t for t in history if now - t < 60]
 
-            if history and (now - history[-1] < USER_QUERY_COOLDOWN_SECONDS):
-                event.stop_event()
-                await event.send(make_reply(event,
-                    f"⏳ 提问太快啦~ 请稍等 {int(USER_QUERY_COOLDOWN_SECONDS)} 秒后再发送新问题。"
-                ))
-                return
+        if history and (now - history[-1] < USER_QUERY_COOLDOWN_SECONDS):
+            record_event(sender_id, group_id, scope, "rate_limited", "cooldown")
+            event.stop_event()
+            await event.send(make_reply(event,
+                f"⏳ 提问太快啦~ 请稍等 {int(USER_QUERY_COOLDOWN_SECONDS)} 秒后再发送新问题。"
+            ))
+            return
 
-            if len(history) >= MAX_USER_QUERIES_PER_MINUTE:
-                event.stop_event()
-                await event.send(make_reply(event,
-                    "⚠️ 最近 1 分钟内的提问过于频繁，请稍等 15 秒后再试哦~"
-                ))
-                return
+        if len(history) >= MAX_USER_QUERIES_PER_MINUTE:
+            record_event(sender_id, group_id, scope, "rate_limited", "per_minute")
+            await self._notify_admin(
+                event,
+                f"rate:{sender_id}",
+                f"QQ {sender_id} 在 1 分钟内触发了模型限流（群：{group_id or '私聊'}）。",
+            )
+            await self._fallback(event, "per_minute")
+            return
 
-            history.append(now)
-            USER_QUERY_TIMESTAMPS[sender_id] = history
+        policy = get_conversation_policy()
+        used_today = daily_llm_count(sender_id)
+        if not is_admin(event) and used_today >= policy["daily_llm_limit"]:
+            await self._fallback(
+                event,
+                "daily_limit",
+                f"今天的智能问答额度已用完（{policy['daily_llm_limit']} 次），已切换为作业助手模式。\n"
+                "可直接使用：/查收、/查作业、/未交、/帮助。",
+            )
+            return
+
+        history.append(now)
+        USER_QUERY_TIMESTAMPS[sender_id] = history
+        record_event(sender_id, group_id, scope, "llm")
 
         student_ctx = ""
-        if event.is_private_chat():
+        if is_private:
             try:
                 b_info = await async_api_get(f"/api/bindings/{sender_id}")
             except Exception:
                 b_info = {}
             if not b_info.get("error"):
-                s_name = b_info.get("student_name", "")
-                s_id = b_info.get("student_id", "")
-                s_cl = format_class_name(b_info.get("class_name", ""), s_id)
-                student_ctx = f"\n\n【当前对话学生】：姓名：{s_name}，学号：{s_id}，班级：{s_cl}。若学生询问自己的作业是否收到或提交情况，可调用 query_student_homework('{s_name}') 为其查询并在回复中客观告知结果。"
+                student_ctx = (
+                    "\n\n【隐私规则】：当前私聊用户已完成花名册身份核验。"
+                    "若其询问自己的作业状态，调用 query_student_homework('我自己')；"
+                    "不得向其披露其他学生的身份、作业或绑定信息。"
+                )
 
         full_prompt = HOMEWORK_SYSTEM_PROMPT + student_ctx
         req.system_prompt = full_prompt
+
+    @filter.on_llm_response()
+    async def sanitize_llm_response(self, event: AstrMessageEvent, response: LLMResponse) -> None:
+        """Replace raw provider error JSON with the deterministic fallback."""
+        if response.tools_call_args:
+            return
+        if event.get_extra("homework_fallback_response"):
+            response.completion_text = ""
+            response.result_chain = MessageChain()
+            return
+        text = response.completion_text or ""
+        if not text and response.result_chain:
+            text = "".join(str(getattr(part, "text", "")) for part in response.result_chain.chain)
+        if not _looks_like_provider_error(text):
+            return
+        event.set_extra("homework_fallback_response", True)
+        sender_id = str(event.get_sender_id() or "")
+        group_id = str(event.get_group_id() or "")
+        record_event(sender_id, group_id, "private" if event.is_private_chat() else "group", "model_error", "unsafe_provider_response")
+        response.tools_call_args = []
+        response.tools_call_name = []
+        response.tools_call_ids = []
+        response.reasoning_content = None
+        response.completion_text = FALLBACK_REPLY
+        response.result_chain = MessageChain().message(FALLBACK_REPLY)
+        await self._notify_admin(
+            event,
+            "model_response_error",
+            f"模型响应异常，已为 QQ {sender_id} 自动降级为本地规则模式（群：{group_id or '私聊'}）。",
+        )
 
     # [LLM Tools]
     @filter.llm_tool(name="query_student_homework")
@@ -230,10 +329,11 @@ class HomeworkPlugin(Star):
                 b_info = {}
             if b_info.get("error"):
                 return "权限不足：未绑定身份的学生无法查询作业。请先发送 /绑定 学号 姓名。"
-            my_sid = str(b_info.get("student_id", "")).strip()
-            my_name = str(b_info.get("student_name", "")).strip()
-            if student_query != my_sid and student_query != my_name:
-                return "权限不足：为保护同学个人隐私，普通学生仅可查询本人的作业状态，无法跨人查询其他同学。"
+            # Never let the model choose another student's identifier. The
+            # identity comes from the verified QQ binding, not tool arguments.
+            student_query = str(b_info.get("student_id", "")).strip()
+            if not student_query:
+                return "未找到当前账号的有效身份绑定，请先发送 /绑定 学号 姓名。"
 
         results = []
         for a in assignments:
@@ -296,7 +396,7 @@ class HomeworkPlugin(Star):
             "2️⃣ 私聊直接发作业压缩包 —— 自动识别身份，秒级规范命名并安全归档入库\n"
             "3️⃣「查作业」—— 查看作业提交人数与整体进度\n"
             "4️⃣「未交」—— 查看当前未交作业名单\n"
-            "5️⃣ 绑定 <学号> [姓名] —— 绑定学生身份（例：绑定 240809010501 支全振）\n"
+            "5️⃣ 绑定 <学号> <姓名> —— 绑定学生身份（例：绑定 240809010501 支全振）\n"
             "6️⃣「我的信息」—— 查看当前绑定的学号、姓名与班级\n\n"
             "👑【助教/管理员专属】：\n"
             "• 查收 <姓名或学号> —— 直接查询指定同学作业（例：查收 支全振）\n"
@@ -315,6 +415,46 @@ class HomeworkPlugin(Star):
         )
         yield make_reply(event, msg)
 
+    @filter.command("会话统计", alias={"每日会话", "会话情况"})
+    async def conversation_stats_cmd(self, event: AstrMessageEvent, param: str = ""):
+        """Owner-only operational view; it contains no message text or student PII."""
+        if not is_super_admin(event):
+            yield make_reply(event, "❌ 权限不足：会话统计仅机器人管理员可查看。")
+            return
+        if not event.is_private_chat():
+            yield make_reply(event, "🔒 为避免暴露运营统计，请私聊机器人发送：/会话统计 [YYYY-MM-DD]")
+            return
+        day = param.strip()
+        if day in {"", "今天", "今日"}:
+            day = None
+        elif not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            yield make_reply(event, "⚠️ 日期格式应为 YYYY-MM-DD，例如：/会话统计 2026-10-10")
+            return
+
+        summary = daily_summary(day)
+        totals = summary["totals"]
+        lines = [
+            f"📊【{summary['day']} 会话运营统计】",
+            "━━━━━━━━━━━━━━━",
+            f"消息总数：{totals.get('message', 0)}",
+            f"模型请求：{totals.get('llm', 0)}",
+            f"规则降级：{totals.get('regex', 0)}",
+            f"未绑定拦截：{totals.get('unbound_blocked', 0)}",
+            f"群聊策略拦截：{totals.get('group_blocked', 0)}",
+            f"频率限流：{totals.get('rate_limited', 0)}",
+            f"模型异常：{totals.get('model_error', 0)}",
+            "━━━━━━━━━━━━━━━",
+            "活跃账号（QQ / 消息 / 模型 / 被策略拦截）：",
+        ]
+        users = summary["top_users"]
+        if not users:
+            lines.append("暂无记录。")
+        else:
+            for sender_id, attempts, llm_count, guarded in users:
+                lines.append(f"• {sender_id} / {attempts or 0} / {llm_count or 0} / {guarded or 0}")
+        lines.append("注：统计不保存提问正文、姓名或学号；仅管理员私聊可查看账号维度。")
+        yield make_reply(event, "\n".join(lines))
+
     # [Binding Commands]
     @filter.command("指定绑定", alias={"代绑", "代绑定"})
     async def assign_bind_student(self, event: AstrMessageEvent, param: str = ""):
@@ -322,7 +462,7 @@ class HomeworkPlugin(Star):
         if not is_ta_or_admin(event):
             yield make_reply(event, 
                 "❌ 权限不足：只有课程助教或管理员可为他人指定绑定。\n"
-                "💡 学生绑定请使用：/绑定 <学号> [姓名]"
+                "💡 学生绑定请使用：/绑定 <学号> <姓名>"
             )
             return
 
@@ -347,17 +487,20 @@ class HomeworkPlugin(Star):
     async def bind_student(self, event: AstrMessageEvent, param: str = ""):
         sender_id = str(event.get_sender_id())
         parts = param.strip().split()
+        if not is_ta_or_admin(event) and not event.is_private_chat():
+            yield make_reply(event, "🔒 为保护学号和姓名，请私聊机器人发送：/绑定 学号 姓名")
+            return
         if not parts:
             if is_ta_or_admin(event):
                 yield make_reply(event, 
                     "💡【绑定用法说明】\n"
-                    "• 本人绑定：/绑定 <学号> [姓名]\n"
+                    "• 本人绑定：/绑定 <学号> <姓名>\n"
                     "• 助教代绑：/绑定 <目标QQ> <学号> [姓名]\n"
                     "例如：/绑定 1689491386 240809010501 支全振"
                 )
             else:
                 yield make_reply(event, 
-                    "💡 用法：/绑定 <学号> [姓名]\n"
+                    "💡 用法：/绑定 <学号> <姓名>\n"
                     "例如：/绑定 240809010501 支全振\n"
                     "（绑定身份后，直接私聊把作业压缩包发给机器人即可自动秒级入库！）"
                 )
@@ -385,8 +528,15 @@ class HomeworkPlugin(Star):
                 student_name = parts[1] if len(parts) > 1 else ""
         else:
             # 普通学生：强制锁定为本人 QQ，禁止替他人指定
+            if len(parts) < 2:
+                yield make_reply(event,
+                    "⚠️ 为核验身份，请同时提供学号和姓名。\n"
+                    "用法：/绑定 <学号> <姓名>\n"
+                    "例如：/绑定 240809010501 张三"
+                )
+                return
             student_id = parts[0]
-            student_name = parts[1] if len(parts) > 1 else ""
+            student_name = " ".join(parts[1:])
 
         async for r in self._do_bind(event, target_qq=target_qq, student_id=student_id, student_name=student_name, is_assigned=is_assigned):
             yield r
@@ -968,14 +1118,14 @@ class HomeworkPlugin(Star):
         options = {}
         for idx, a in enumerate(assignments, 1):
             options[str(idx)] = (
-                f"{API_BASE}/api/assignments/{a['id']}/export",
+                authenticated_download_url(f"/api/assignments/{a['id']}/export"),
                 f"{a['name']}_全员作业.zip",
                 a['name']
             )
             options[a['id']] = options[str(idx)]
 
         options["0"] = (
-            f"{API_BASE}/api/assignments/export/all",
+            authenticated_download_url("/api/assignments/export/all"),
             "整学期全量作业归档.zip",
             "整学期全量作业"
         )
@@ -1015,7 +1165,7 @@ class HomeworkPlugin(Star):
             yield make_reply(event, "❌ 权限不足：整学期归档导出仅限课程助教或管理员执行。")
             return
 
-        url = f"{API_BASE}/api/assignments/export/all"
+        url = authenticated_download_url("/api/assignments/export/all")
         filename = "整学期全量作业归档.zip"
         async for res in upload_file_action(event, url, filename, "整学期全量作业"):
             yield res
@@ -1120,6 +1270,7 @@ class HomeworkPlugin(Star):
         group_id = str(event.get_group_id() or "")
         session_key = (sender_id, group_id)
         is_private = event.is_private_chat()
+        record_event(sender_id, group_id, "private" if is_private else "group", "message")
 
         async def reply(msg):
             if isinstance(msg, str):
@@ -1189,23 +1340,10 @@ class HomeworkPlugin(Star):
                 return
 
             if bind_data.get("error"):
-                await reply(f"⏳ 正在接收并把作业【{raw_filename}】暂存...")
-                local_path = await file_comp.get_file()
-                if not local_path or not os.path.exists(local_path):
-                    await reply("❌ 接收文件失败，请重新发送。")
-                    return
-
-                PENDING_SESSIONS[session_key] = {
-                    "time": time.time(),
-                    "type": "bind_and_submit",
-                    "file_path": local_path,
-                    "filename": raw_filename,
-                }
                 await reply(
-                    f"👋 同学你好！已安全接收你的作业【{raw_filename}】。\n"
-                    "由于你是首次使用，请直接回复你的【学号】（例如：240809010501）：\n"
-                    "核对花名册后将自动完成绑定，并将刚才的作业直接存入系统！\n"
-                    "（回复 取消 可放弃本次提交，120 秒内有效）"
+                    "🔐 为保护作业归属，未绑定身份的私聊文件不会暂存或上传。\n"
+                    "请先发送：/绑定 学号 姓名\n"
+                    "完成花名册核验后，请重新发送作业文件。"
                 )
                 return
 
@@ -1732,24 +1870,11 @@ class HomeworkPlugin(Star):
                 await reply(card)
                 return
             else:
-                if explicit_sid:
-                    bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": explicit_sid})
-                    if bind_res.get("success"):
-                        b = bind_res.get("binding", {})
-                        st_name = b.get("student_name", "")
-                        cl_name = format_class_name(b.get("class_name", ""), explicit_sid)
-                        card = await build_student_status_card(explicit_sid, st_name, cl_name)
-                        await reply(f"🎉 自动完成身份绑定：【{st_name}】同学（{cl_name}）！\n\n" + card)
-                        return
-
                 if is_private:
-                    PENDING_SESSIONS[session_key] = {
-                        "time": time.time(),
-                        "type": "bind_and_report_status",
-                    }
                     await reply(
-                        "👋 同学你好呀！我还不认识你呢，你是哪位同学呀？\n"
-                        "请直接回复你的【学号】（例如：240809010501），我马上帮你核对并查询你的作业！"
+                        "🔐 查询个人作业前请先完成实名绑定。\n"
+                        "请发送：/绑定 学号 姓名\n"
+                        "例如：/绑定 240809010501 张三"
                     )
                     return
                 else:
@@ -1757,35 +1882,3 @@ class HomeworkPlugin(Star):
                         "同学你好！我还不认识你呢，为了保护你的个人信息，请直接【私聊我】发送学号绑定，即可随时查询你的作业状态哦~"
                     )
                     return
-
-        if is_private and not text.startswith("/") and not text.startswith("!"):
-            sid = extract_student_id(text)
-            clean_digits = text.replace(" ", "").replace("学号", "").replace("：", "").replace(":", "")
-            if sid and len(clean_digits) <= 16:
-                try:
-                    check_b = await async_api_get(f"/api/bindings/{sender_id}")
-                except Exception:
-                    check_b = {}
-
-                if check_b.get("error"):
-                    event.stop_event()
-                    await reply(f"⏳ 正在核对学号【{sid}】...")
-                    bind_res = await async_api_post_json("/api/bindings", {"qq_id": sender_id, "student_id": sid})
-                    if bind_res.get("success"):
-                        b = bind_res.get("binding", {})
-                        cl_name = format_class_name(b.get("class_name", ""), sid)
-                        st_name = b.get("student_name", "")
-                        card = await build_student_status_card(sid, st_name, cl_name)
-                        await reply(
-                            f"🎉【学生身份绑定成功】\n"
-                            "━━━━━━━━━━━━━━━\n"
-                            f"👤 学生姓名：{st_name}\n"
-                            f"🆔 学号：{sid}\n"
-                            f"🏫 班级：{cl_name}\n"
-                            "━━━━━━━━━━━━━━━\n\n"
-                            + card
-                        )
-                        return
-                    else:
-                        await reply(f"⚠️ 绑定失败：{bind_res.get('error')}")
-                        return

@@ -357,6 +357,21 @@ target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
 		t.Fatalf("expected 200 for binding, got %d: %s", recBind.Code, recBind.Body.String())
 	}
 
+	// A QQ identity is only trusted when both submitted fields match the roster.
+	for name, body := range map[string][]byte{
+		"missing_name": []byte(`{"qq_id":"100000001","student_id":"240809010502"}`),
+		"wrong_name":   []byte(`{"qq_id":"100000002","student_id":"240809010502","student_name":"错误姓名"}`),
+		"unknown_id":   []byte(`{"qq_id":"100000003","student_id":"299999999999","student_name":"不存在"}`),
+	} {
+		req := httptest.NewRequest("POST", "/api/bindings?token=secret-token-123", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("expected 400 for %s binding, got %d: %s", name, rec.Code, rec.Body.String())
+		}
+	}
+
 	// 16.2 Get binding
 	reqGetBind := httptest.NewRequest("GET", "/api/bindings/1689491386?token=secret-token-123", nil)
 	recGetBind := httptest.NewRecorder()
@@ -467,6 +482,5 @@ target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
 		t.Fatalf("expected 200 for unbind by student_id, got %d: %s", recUnbind.Code, recUnbind.Body.String())
 	}
 }
-
 
 

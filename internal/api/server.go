@@ -959,8 +959,8 @@ func (s *Server) handleCreateBinding(w http.ResponseWriter, r *http.Request) {
 	req.StudentName = strings.TrimSpace(req.StudentName)
 	req.ClassName = strings.TrimSpace(req.ClassName)
 
-	if req.QQID == "" || req.StudentID == "" {
-		writeJSONError(w, http.StatusBadRequest, "qq_id and student_id are required")
+	if req.QQID == "" || req.StudentID == "" || req.StudentName == "" {
+		writeJSONError(w, http.StatusBadRequest, "qq_id, student_id and student_name are required")
 		return
 	}
 
@@ -977,18 +977,17 @@ func (s *Server) handleCreateBinding(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if rosterFound {
-		if req.StudentName != "" && req.StudentName != foundName {
-			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("学号 %s 与姓名 %q 不匹配（花名册中应为 %s）", req.StudentID, req.StudentName, foundName))
-			return
-		}
-		req.StudentName = foundName
-		if req.ClassName == "" {
-			req.ClassName = foundClass
-		}
-	} else if req.StudentName == "" {
-		writeJSONError(w, http.StatusBadRequest, "花名册中未检索到该学号，请同时提供姓名")
+	if !rosterFound {
+		writeJSONError(w, http.StatusBadRequest, "花名册中未检索到该学号，无法完成身份绑定")
 		return
+	}
+	if req.StudentName != foundName {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("学号 %s 与姓名 %q 不匹配（花名册中应为 %s）", req.StudentID, req.StudentName, foundName))
+		return
+	}
+	req.StudentName = foundName
+	if req.ClassName == "" {
+		req.ClassName = foundClass
 	}
 
 	req.ClassName = roster.NormalizeClassName(req.ClassName)
@@ -1278,4 +1277,3 @@ func (s *Server) handleCreateAssignment(w http.ResponseWriter, r *http.Request) 
 		"roster_count": createdRule.Roster.Count(),
 	})
 }
-

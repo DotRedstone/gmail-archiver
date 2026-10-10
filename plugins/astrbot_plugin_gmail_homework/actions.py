@@ -43,4 +43,6 @@ async def upload_file_action(event: AstrMessageEvent, download_url: str, filenam
             )
             yield make_reply(event, f"✅ 作业归档【{filename}】已作为私聊文件发送给你！")
     except Exception as e:
-        yield make_reply(event, f"❌ 上传文件失败: {e}\n💡 备用下载直链：{download_url}")
+        # download_url can carry the API token for NapCat, so never echo it
+        # into a group/private chat on failure.
+        yield make_reply(event, f"❌ 上传文件失败: {e}\n💡 请联系助教重试导出。")
