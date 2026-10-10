@@ -61,7 +61,6 @@ try:
     )
     from .actions import make_reply, upload_file_action
     from .conversation_policy import claim_alert, daily_llm_count, daily_summary, record_event
-    from .course_intents import classify_course_query
 except ImportError:
     from config import (
         API_BASE,
@@ -105,7 +104,6 @@ except ImportError:
     )
     from actions import make_reply, upload_file_action
     from conversation_policy import claim_alert, daily_llm_count, daily_summary, record_event
-    from course_intents import classify_course_query
 
 # [State]
 PENDING_SESSIONS = {}
@@ -194,7 +192,7 @@ ASSISTANT_SYSTEM_PROMPT = """你是一个可靠、自然的 QQ 智能助手。�
 - 自然、友好、简洁，直接回答问题；不知道就坦诚说明。
 - 不捏造人设、姓名、身份或与用户的既往关系。"""
 
-@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.7.0")
+@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.7.1")
 class HomeworkPlugin(Star):
     def __init__(self, context):
         super().__init__(context)
@@ -213,22 +211,6 @@ class HomeworkPlugin(Star):
             if tool and tool.active:
                 selected.add_tool(tool)
         return selected
-
-    async def _handle_factual_course_query(self, event: AstrMessageEvent, intent: str, hint: str) -> str:
-        """Execute privacy-sensitive read skills without relying on model choice."""
-        if intent == "my_role":
-            return await self.tool_get_my_course_role(event)
-        if intent == "my_identity":
-            return await self.tool_get_my_verified_identity(event)
-        if intent == "my_homework":
-            return await self.tool_get_my_homework_status(event)
-        if intent == "teaching_team":
-            return await self.tool_send_teaching_team(event)
-        if intent == "missing_students":
-            return await self.tool_send_missing_students(event, hint)
-        if intent == "unbound_roster":
-            return await self.tool_send_unbound_roster(event)
-        return await self.tool_send_course_roster(event)
 
     async def _notify_admin(self, event: AstrMessageEvent, alert_key: str, message: str) -> None:
         """Send a rate-limited operational alert without exposing student content."""
@@ -316,16 +298,6 @@ class HomeworkPlugin(Star):
 
         history.append(now)
         USER_QUERY_TIMESTAMPS[sender_id] = history
-        course_query = classify_course_query(msg_text)
-        if course_query:
-            intent, hint = course_query
-            record_event(sender_id, group_id, scope, "skill", intent)
-            event.stop_event()
-            result = await self._handle_factual_course_query(event, intent, hint)
-            if not result.startswith("已通过私聊发送"):
-                await event.send(make_reply(event, result))
-            return
-
         projected_daily_count = daily_llm_count(sender_id) + 1
         policy = get_conversation_policy()
         if not is_admin(event) and projected_daily_count >= policy["daily_llm_alert_threshold"]:
@@ -339,16 +311,21 @@ class HomeworkPlugin(Star):
         student_ctx = "\n\n【当前会话】：课程群聊。不要在群里调用或泄露任何个人身份信息。"
         if is_private:
             student_ctx = "\n\n【当前会话】：私聊。课程角色由 QQ 权限配置核验，学生身份尚未核验。"
+            if is_super_admin(event):
+                student_ctx += "当前账号是超级管理员，可以使用管理员私聊工具。"
+            elif is_ta_or_admin(event):
+                student_ctx += "当前账号是课程助教，可以使用管理员私聊工具。"
             try:
                 b_info = await async_api_get(f"/api/bindings/{sender_id}")
             except Exception:
                 b_info = {}
             if b_info.get("student_id") and b_info.get("student_name") and not b_info.get("error"):
-                student_ctx = "\n\n【当前会话】：私聊且该用户已完成花名册身份核验。"
+                student_ctx += "该用户已完成花名册身份核验。"
 
         full_prompt = ASSISTANT_SYSTEM_PROMPT + student_ctx
-        req.system_prompt = full_prompt
         req.func_tool = self._course_toolset(event)
+        tool_names = "、".join(req.func_tool.names())
+        req.system_prompt = full_prompt + f"\n\n【本次可用课程工具】{tool_names}。只有实际执行工具并收到成功结果后，才能说查询完成或名单已发送。"
 
     @filter.on_llm_response()
     async def sanitize_llm_response(self, event: AstrMessageEvent, response: LLMResponse) -> None:
