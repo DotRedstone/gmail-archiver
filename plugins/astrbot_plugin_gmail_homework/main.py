@@ -258,6 +258,11 @@ class HomeworkPlugin(Star):
         policy = get_conversation_policy()
         used_today = daily_llm_count(sender_id)
         if not is_admin(event) and used_today >= policy["daily_llm_limit"]:
+            await self._notify_admin(
+                event,
+                f"daily_limit:{sender_id}",
+                f"QQ {sender_id} 已用完当日模型额度（{policy['daily_llm_limit']} 次），已自动降级为本地规则模式。",
+            )
             await self._fallback(
                 event,
                 "daily_limit",
