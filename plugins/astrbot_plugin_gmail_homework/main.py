@@ -1,5 +1,6 @@
 # [Plugin]
 import asyncio
+from datetime import datetime, timezone
 import os
 import re
 import sys
@@ -10,6 +11,7 @@ from astrbot.api.event.filter import CustomFilter
 from astrbot.api.star import register, Star
 from astrbot.api.provider import ProviderRequest, LLMResponse
 from astrbot.api.message_components import File
+from astrbot.core.agent.tool import ToolSet
 from astrbot.core.message.message_event_result import MessageChain
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +61,7 @@ try:
     )
     from .actions import make_reply, upload_file_action
     from .conversation_policy import claim_alert, daily_llm_count, daily_summary, record_event
+    from .course_intents import classify_course_query
 except ImportError:
     from config import (
         API_BASE,
@@ -102,6 +105,7 @@ except ImportError:
     )
     from actions import make_reply, upload_file_action
     from conversation_policy import claim_alert, daily_llm_count, daily_summary, record_event
+    from course_intents import classify_course_query
 
 # [State]
 PENDING_SESSIONS = {}
@@ -158,24 +162,73 @@ def _looks_like_provider_error(text: str) -> bool:
         return True
     return stripped.startswith("{") or stripped.startswith("[")
 
+
+def _current_assignment(assignments: list[dict]) -> dict:
+    """Choose the nearest upcoming deadline, or the most recent past one."""
+    now = datetime.now(timezone.utc)
+    dated = []
+    for assignment in assignments:
+        try:
+            deadline = datetime.fromisoformat(str(assignment["deadline"]).replace("Z", "+00:00"))
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            dated.append((deadline, assignment))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if dated:
+        upcoming = [entry for entry in dated if entry[0] >= now]
+        return min(upcoming, key=lambda entry: entry[0])[1] if upcoming else max(dated, key=lambda entry: entry[0])[1]
+    return assignments[-1]
+
 ASSISTANT_SYSTEM_PROMPT = """你是一个可靠、自然的 QQ 智能助手。默认用中文交流，正常回答问候、日常问题、学习讨论和课程相关问题；不要把每句话都引回作业或重复功能说明。
 
-你也可以使用课程作业技能：私聊上传压缩包、身份绑定、作业状态查询、导出、查重和课程管理。询问全班提交进度时调用 get_course_submission_status；询问本人作业时调用 get_my_homework_status；需要实时课程数据时，必须优先调用已注册工具，不能声称“没有工具”或改用无关工具。
+你也可以使用课程作业技能：私聊上传压缩包、身份绑定、作业状态查询、导出、查重和课程管理。询问全班提交进度时调用 get_course_submission_status；询问本人作业时调用 get_my_homework_status；询问谁没交时调用 send_missing_students；询问自己的课程权限时调用 get_my_course_role。需要实时课程数据时必须先调用对应工具，不能凭记忆回答、虚构工具结果或声称已经发送了尚未发送的名单。
 
 【身份与隐私】
 - 只有私聊且完成花名册核验的用户，才可通过 get_my_verified_identity 查询其自己的绑定身份；用户问“我是谁”“我的信息”时应调用该工具。
 - 群聊中不得推断、展示或确认任何人的学号、姓名、绑定状态或作业信息；即使有人问“我是谁”，也只能说明你无法在群里核验身份，并提示其私聊完成绑定后查询。
 - 普通学生只能查询本人；不得用任何工具向其披露他人的身份、作业或绑定信息。
-- 管理员私聊请求班级绑定名单、未绑定名单或教学管理团队（例如“谁是助教”“助教名单”“管理员有哪些人”）时，分别调用 send_course_roster、send_unbound_roster 或 send_teaching_team；这些工具会直接私密发送结果，不能在模型回复中复述名单。
+- 管理员私聊请求班级绑定名单、未绑定名单、教学管理团队或未交学生名单时，分别调用 send_course_roster、send_unbound_roster、send_teaching_team 或 send_missing_students；这些工具会直接私密发送结果，不能在模型回复中复述名单。
 
 【回复风格】
 - 自然、友好、简洁，直接回答问题；不知道就坦诚说明。
 - 不捏造人设、姓名、身份或与用户的既往关系。"""
 
-@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.6.4")
+@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.7.0")
 class HomeworkPlugin(Star):
     def __init__(self, context):
         super().__init__(context)
+
+    def _course_toolset(self, event: AstrMessageEvent) -> ToolSet:
+        """Provide the current plugin's tools without depending on persona cache."""
+        names = ["get_homework_list", "get_course_submission_status"]
+        if event.is_private_chat():
+            names.extend(["get_my_verified_identity", "get_my_course_role", "get_my_homework_status", "query_student_homework"])
+            if is_admin(event):
+                names.extend(["send_course_roster", "send_unbound_roster", "send_teaching_team", "send_missing_students"])
+        manager = self.context.get_llm_tool_manager()
+        selected = ToolSet()
+        for name in names:
+            tool = manager.get_func(name)
+            if tool and tool.active:
+                selected.add_tool(tool)
+        return selected
+
+    async def _handle_factual_course_query(self, event: AstrMessageEvent, intent: str, hint: str) -> str:
+        """Execute privacy-sensitive read skills without relying on model choice."""
+        if intent == "my_role":
+            return await self.tool_get_my_course_role(event)
+        if intent == "my_identity":
+            return await self.tool_get_my_verified_identity(event)
+        if intent == "my_homework":
+            return await self.tool_get_my_homework_status(event)
+        if intent == "teaching_team":
+            return await self.tool_send_teaching_team(event)
+        if intent == "missing_students":
+            return await self.tool_send_missing_students(event, hint)
+        if intent == "unbound_roster":
+            return await self.tool_send_unbound_roster(event)
+        return await self.tool_send_course_roster(event)
 
     async def _notify_admin(self, event: AstrMessageEvent, alert_key: str, message: str) -> None:
         """Send a rate-limited operational alert without exposing student content."""
@@ -218,7 +271,7 @@ class HomeworkPlugin(Star):
             except Exception:
                 bind_data = {}
 
-            if bind_data.get("error"):
+            if bind_data.get("error") or not bind_data.get("student_id") or not bind_data.get("student_name"):
                 record_event(sender_id, group_id, scope, "unbound_blocked", "identity_required")
                 event.stop_event()
                 await event.send(make_reply(event,
@@ -242,7 +295,7 @@ class HomeworkPlugin(Star):
         history = USER_QUERY_TIMESTAMPS.get(sender_id, [])
         history = [t for t in history if now - t < 60]
 
-        if history and (now - history[-1] < USER_QUERY_COOLDOWN_SECONDS):
+        if not is_admin(event) and history and (now - history[-1] < USER_QUERY_COOLDOWN_SECONDS):
             record_event(sender_id, group_id, scope, "rate_limited", "cooldown")
             event.stop_event()
             await event.send(make_reply(event,
@@ -250,7 +303,7 @@ class HomeworkPlugin(Star):
             ))
             return
 
-        if len(history) >= MAX_USER_QUERIES_PER_MINUTE:
+        if not is_admin(event) and len(history) >= MAX_USER_QUERIES_PER_MINUTE:
             record_event(sender_id, group_id, scope, "rate_limited", "per_minute")
             await self._notify_admin(
                 event,
@@ -261,6 +314,18 @@ class HomeworkPlugin(Star):
             await event.send(make_reply(event, "⏳ 当前提问过于频繁，请稍后再试。"))
             return
 
+        history.append(now)
+        USER_QUERY_TIMESTAMPS[sender_id] = history
+        course_query = classify_course_query(msg_text)
+        if course_query:
+            intent, hint = course_query
+            record_event(sender_id, group_id, scope, "skill", intent)
+            event.stop_event()
+            result = await self._handle_factual_course_query(event, intent, hint)
+            if not result.startswith("已通过私聊发送"):
+                await event.send(make_reply(event, result))
+            return
+
         projected_daily_count = daily_llm_count(sender_id) + 1
         policy = get_conversation_policy()
         if not is_admin(event) and projected_daily_count >= policy["daily_llm_alert_threshold"]:
@@ -269,22 +334,21 @@ class HomeworkPlugin(Star):
                 f"daily_volume:{sender_id}",
                 f"QQ {sender_id} 当日模型请求已达 {projected_daily_count} 次（告警阈值：{policy['daily_llm_alert_threshold']}）；请求仍正常进入模型。",
             )
-
-        history.append(now)
-        USER_QUERY_TIMESTAMPS[sender_id] = history
         record_event(sender_id, group_id, scope, "llm")
 
         student_ctx = "\n\n【当前会话】：课程群聊。不要在群里调用或泄露任何个人身份信息。"
         if is_private:
+            student_ctx = "\n\n【当前会话】：私聊。课程角色由 QQ 权限配置核验，学生身份尚未核验。"
             try:
                 b_info = await async_api_get(f"/api/bindings/{sender_id}")
             except Exception:
                 b_info = {}
-            if not b_info.get("error"):
+            if b_info.get("student_id") and b_info.get("student_name") and not b_info.get("error"):
                 student_ctx = "\n\n【当前会话】：私聊且该用户已完成花名册身份核验。"
 
         full_prompt = ASSISTANT_SYSTEM_PROMPT + student_ctx
         req.system_prompt = full_prompt
+        req.func_tool = self._course_toolset(event)
 
     @filter.on_llm_response()
     async def sanitize_llm_response(self, event: AstrMessageEvent, response: LLMResponse) -> None:
@@ -328,13 +392,24 @@ class HomeworkPlugin(Star):
             binding = await async_api_get(f"/api/bindings/{sender_id}")
         except Exception:
             return "暂时无法核验当前绑定身份，请稍后重试。"
-        if binding.get("error"):
+        if binding.get("error") or not binding.get("student_id") or not binding.get("student_name"):
             return "当前账号尚未完成身份绑定。请发送 /绑定 学号 姓名，核验成功后再查询。"
 
         name = str(binding.get("student_name", "")).strip()
         student_id = str(binding.get("student_id", "")).strip()
         class_name = format_class_name(str(binding.get("class_name", "")), student_id)
         return f"当前私聊账号的已验证身份：姓名 {name}，学号 {student_id}，班级 {class_name}。"
+
+    @filter.llm_tool(name="get_my_course_role")
+    async def tool_get_my_course_role(self, event: AstrMessageEvent) -> str:
+        '''核实当前私聊用户在课程系统中的真实权限。用户问“我是助教吗”“我是管理员吗”“我的角色/权限是什么”时调用。'''
+        if not event.is_private_chat():
+            return "课程角色请私聊机器人查询，群聊中不会核验个人身份。"
+        if is_super_admin(event):
+            return "当前账号的课程角色：超级管理员。"
+        if is_ta_or_admin(event):
+            return "当前账号的课程角色：课程助教。"
+        return "当前账号未配置为课程助教或管理员。"
 
     @filter.llm_tool(name="get_my_homework_status")
     async def tool_get_my_homework_status(self, event: AstrMessageEvent) -> str:
@@ -355,7 +430,10 @@ class HomeworkPlugin(Star):
             bindings_data = await async_api_get("/api/bindings")
         except Exception:
             return "暂时无法读取班级人员名单，请稍后重试。"
-        await event.send(make_reply(event, render_class_bindings_card(roster_data, bindings_data, class_name.strip())))
+        try:
+            await event.send(make_reply(event, render_class_bindings_card(roster_data, bindings_data, class_name.strip())))
+        except Exception:
+            return "名单发送失败，请稍后重试。"
         return "已通过私聊发送班级人员名单。不要在回复中复述名单内容。"
 
     @filter.llm_tool(name="send_unbound_roster")
@@ -370,7 +448,10 @@ class HomeworkPlugin(Star):
             bindings_data = await async_api_get("/api/bindings")
         except Exception:
             return "暂时无法读取未绑定名单，请稍后重试。"
-        await event.send(make_reply(event, render_unbound_students_card(roster_data, bindings_data, class_name.strip())))
+        try:
+            await event.send(make_reply(event, render_unbound_students_card(roster_data, bindings_data, class_name.strip())))
+        except Exception:
+            return "名单发送失败，请稍后重试。"
         return "已通过私聊发送未绑定名单。不要在回复中复述名单内容。"
 
     async def _render_teaching_team_card(self) -> str:
@@ -415,8 +496,43 @@ class HomeworkPlugin(Star):
             return "隐私保护：教学管理团队名单不能在群里发送。请让课程助教或管理员私聊机器人查询。"
         if not is_ta_or_admin(event):
             return "权限不足：教学管理团队名单仅限课程助教或管理员私聊查看。"
-        await event.send(make_reply(event, await self._render_teaching_team_card()))
+        try:
+            await event.send(make_reply(event, await self._render_teaching_team_card()))
+        except Exception:
+            return "教学管理团队名单发送失败，请稍后重试。"
         return "已通过私聊发送教学管理团队名单。不要在回复中复述名单内容。"
+
+    @filter.llm_tool(name="send_missing_students")
+    async def tool_send_missing_students(self, event: AstrMessageEvent, assignment_hint: str = "") -> str:
+        '''向课程助教或管理员私聊发送某次作业的未交学生名单。
+
+        用户问“谁没交作业”“这次作业未交名单”时调用。没有指定实验时查询截止时间最近的作业。
+
+        Args:
+            assignment_hint(string): 用户指定的实验编号或作业名称；留空表示最近一次作业
+        '''
+        if not event.is_private_chat():
+            return "未交学生名单只在课程助教或管理员的私聊中提供。"
+        if not is_ta_or_admin(event):
+            return "权限不足：未交学生名单仅限课程助教或管理员私聊查看。"
+        assignments = get_assignments()
+        if not assignments:
+            return "暂时无法读取作业列表，请稍后重试。"
+        hint = assignment_hint.strip()
+        if hint in {"这次", "这次作业", "当前作业", "最近一次作业", "最新作业"}:
+            hint = ""
+        assignment = match_assignment(hint, assignments) if hint else _current_assignment(assignments)
+        if not assignment:
+            names = "、".join(str(item.get("name", "")) for item in assignments)
+            return f"找不到“{hint}”对应的作业。当前作业：{names}。"
+        try:
+            data = await async_api_get(f"/api/assignments/{assignment['id']}/missing")
+            if not isinstance(data, dict) or data.get("error"):
+                return "暂时无法读取未交名单，请稍后重试。"
+            await event.send(make_reply(event, render_missing_list(data)))
+        except Exception:
+            return "暂时无法读取未交名单，请稍后重试。"
+        return "已通过私聊发送未交学生名单。不要在回复中复述名单内容。"
 
     @filter.llm_tool(name="query_student_homework")
     async def tool_query_student(self, event: AstrMessageEvent, student_name_or_id: str) -> str:
@@ -425,6 +541,8 @@ class HomeworkPlugin(Star):
         Args:
             student_name_or_id(string): 学生的姓名或学号
         '''
+        if not event.is_private_chat():
+            return "个人作业状态请私聊机器人查询，群聊中不会披露。"
         assignments = get_assignments()
         if not assignments:
             return "未能获取到当前作业列表。"
@@ -437,7 +555,7 @@ class HomeworkPlugin(Star):
                 b_info = await async_api_get(f"/api/bindings/{sender_id}")
             except Exception:
                 b_info = {}
-            if b_info.get("error"):
+            if b_info.get("error") or not b_info.get("student_id") or not b_info.get("student_name"):
                 return "权限不足：未绑定身份的学生无法查询作业。请先发送 /绑定 学号 姓名。"
             # Never let the model choose another student's identifier. The
             # identity comes from the verified QQ binding, not tool arguments.
@@ -537,14 +655,13 @@ class HomeworkPlugin(Star):
         msg = (
             "📖【并行计算课程 · 作业助手指南】\n"
             "━━━━━━━━━━━━━━━\n"
-            "💡 提示：日常无需输入斜杠「/」，直接自然提问或发送快捷口令即可！\n\n"
-            "🎓【学生日常功能】（群聊/私聊均可）：\n"
-            "1️⃣「看看我交了吗？」或「查收」—— 自动核对个人作业归档状态\n"
+            "💡 提示：日常可以直接自然提问；确定性操作请使用 /命令。\n\n"
+            "🎓【学生日常功能】：\n"
+            "1️⃣ 私聊问「我交了吗？」或发送「/查收」—— 核对本人作业归档状态\n"
             "2️⃣ 私聊直接发作业压缩包 —— 自动识别身份，秒级规范命名并安全归档入库\n"
             "3️⃣「查作业」—— 查看作业提交人数与整体进度\n"
-            "4️⃣「未交」—— 查看当前未交作业名单\n"
-            "5️⃣ 绑定 <学号> <姓名> —— 绑定学生身份\n"
-            "6️⃣「我的信息」—— 查看当前绑定的学号、姓名与班级\n\n"
+            "4️⃣ 私聊发送 /绑定 <学号> <姓名> —— 绑定学生身份\n"
+            "5️⃣ 私聊问「我是谁」—— 查看已核验的本人信息\n\n"
             "👑【助教/管理员专属】：\n"
             "• 查收 <姓名或学号> —— 直接查询指定同学作业\n"
             "• 指定绑定 <QQ> <学号> [姓名] —— 直接为指定学生代绑身份\n"
@@ -554,6 +671,7 @@ class HomeworkPlugin(Star):
             "• 私聊发实验卡文件 —— 自动提取实验号并一键分发群文件与广播\n"
             "• 设为班级群 —— 在群内执行，将当前群标记为作业通告群\n"
             "• 助教列表 —— 查看教学管理团队人员\n"
+            "• 私聊问「这次作业谁没交」或发送 /未交 —— 查看未交名单\n"
             "• 班级人员列表 / 绑定列表 [班级] —— 查看全班已绑定 QQ 的学生清单（按班级分组）\n"
             "• 未绑定名单 [班级] —— 查看全班尚未绑定 QQ 的学生催交名单\n\n"
             "👑【超级管理员专属】：\n"
@@ -586,7 +704,7 @@ class HomeworkPlugin(Star):
             "━━━━━━━━━━━━━━━",
             f"消息总数：{totals.get('message', 0)}",
             f"模型请求：{totals.get('llm', 0)}",
-            f"本地技能处理：{totals.get('regex', 0)}",
+            f"本地技能处理：{totals.get('skill', 0) + totals.get('regex', 0)}",
             f"未绑定拦截：{totals.get('unbound_blocked', 0)}",
             f"群聊策略拦截：{totals.get('group_blocked', 0)}",
             f"频率限流：{totals.get('rate_limited', 0)}",
@@ -608,6 +726,9 @@ class HomeworkPlugin(Star):
     @filter.custom_filter(ExplicitSlashCommand, False)
     async def assign_bind_student(self, event: AstrMessageEvent, param: str = ""):
         """助教专属：直接指定任意 QQ 号与学生身份绑定"""
+        if not event.is_private_chat():
+            yield make_reply(event, "指定绑定涉及个人身份，请私聊机器人操作。")
+            return
         if not is_ta_or_admin(event):
             yield make_reply(event, 
                 "❌ 权限不足：只有课程助教或管理员可为他人指定绑定。\n"
@@ -637,7 +758,7 @@ class HomeworkPlugin(Star):
     async def bind_student(self, event: AstrMessageEvent, param: str = ""):
         sender_id = str(event.get_sender_id())
         parts = param.strip().split()
-        if not is_ta_or_admin(event) and not event.is_private_chat():
+        if not event.is_private_chat():
             yield make_reply(event, "🔒 为保护学号和姓名，请私聊机器人发送：/绑定 学号 姓名")
             return
         if not parts:
@@ -739,6 +860,9 @@ class HomeworkPlugin(Star):
     @filter.command("我的信息", alias={"查询绑定", "我的绑定"})
     @filter.custom_filter(ExplicitSlashCommand, False)
     async def my_info(self, event: AstrMessageEvent):
+        if not event.is_private_chat():
+            yield make_reply(event, "个人身份信息请私聊机器人查询。")
+            return
         sender_id = str(event.get_sender_id())
         try:
             resp = await async_api_get(f"/api/bindings/{sender_id}")
@@ -769,6 +893,9 @@ class HomeworkPlugin(Star):
     @filter.custom_filter(ExplicitSlashCommand, False)
     async def unbind_student(self, event: AstrMessageEvent, param: str = ""):
         # 想解绑只能助教有权限解绑
+        if not event.is_private_chat():
+            yield make_reply(event, "解绑涉及个人身份，请私聊机器人操作。")
+            return
         if not is_ta_or_admin(event):
             yield make_reply(event, 
                 "❌ 权限不足：为防止误解绑导致平时作业统计异常，学生账号解绑已锁定。\n"
@@ -853,6 +980,9 @@ class HomeworkPlugin(Star):
     @filter.custom_filter(ExplicitSlashCommand, False)
     async def class_members_cmd(self, event: AstrMessageEvent, param: str = ""):
         """查看全班已绑定 QQ 的学生列表（按班级分组）：/班级人员 [班级名]"""
+        if not event.is_private_chat():
+            yield make_reply(event, "班级人员名单请由课程助教或管理员私聊机器人查询。")
+            return
         if not is_ta_or_admin(event):
             yield make_reply(event, "❌ 权限不足：为保护同学隐私，班级人员绑定清单仅限助教或管理员查看。\n💡 如需查看自己的绑定状态，请发送「我的信息」或「/查收」。")
             return
@@ -875,6 +1005,9 @@ class HomeworkPlugin(Star):
     @filter.custom_filter(ExplicitSlashCommand, False)
     async def unbound_members_cmd(self, event: AstrMessageEvent, param: str = ""):
         """查看全班尚未绑定 QQ 的学生催交名单：/未绑定 [班级名]"""
+        if not event.is_private_chat():
+            yield make_reply(event, "未绑定名单请由课程助教或管理员私聊机器人查询。")
+            return
         if not is_ta_or_admin(event):
             yield make_reply(event, "❌ 权限不足：为保护同学隐私，未绑定名单仅限助教或管理员查看。")
             return
@@ -952,6 +1085,9 @@ class HomeworkPlugin(Star):
     @filter.command("添加助教")
     @filter.custom_filter(ExplicitSlashCommand, False)
     async def add_ta_cmd(self, event: AstrMessageEvent, qq: str = ""):
+        if not event.is_private_chat():
+            yield make_reply(event, "助教任命请私聊机器人操作。")
+            return
         if not is_super_admin(event):
             yield make_reply(event, "❌ 权限不足：仅超级管理员可任命助教。")
             return
@@ -979,6 +1115,9 @@ class HomeworkPlugin(Star):
     @filter.command("移除助教")
     @filter.custom_filter(ExplicitSlashCommand, False)
     async def remove_ta_cmd(self, event: AstrMessageEvent, qq: str = ""):
+        if not event.is_private_chat():
+            yield make_reply(event, "助教移除请私聊机器人操作。")
+            return
         if not is_super_admin(event):
             yield make_reply(event, "❌ 权限不足：仅超级管理员可移除助教。")
             return
@@ -994,6 +1133,9 @@ class HomeworkPlugin(Star):
     @filter.command("助教列表")
     @filter.custom_filter(ExplicitSlashCommand, False)
     async def list_ta_cmd(self, event: AstrMessageEvent):
+        if not event.is_private_chat():
+            yield make_reply(event, "教学管理团队名单请由课程助教或管理员私聊机器人查询。")
+            return
         if not is_ta_or_admin(event):
             yield make_reply(event, "❌ 权限不足：仅助教或管理员可查看助教名单。")
             return
@@ -1058,6 +1200,9 @@ class HomeworkPlugin(Star):
     @filter.command("未交")
     @filter.custom_filter(ExplicitSlashCommand, False)
     async def missing_cmd(self, event: AstrMessageEvent, param: str = ""):
+        if not event.is_private_chat() or not is_ta_or_admin(event):
+            yield make_reply(event, "未交学生名单仅限课程助教或管理员私聊查询。")
+            return
         assignments = get_assignments()
         if not assignments:
             yield make_reply(event, "❌ 获取作业列表失败或当前未配置任何作业。")
@@ -1107,6 +1252,9 @@ class HomeworkPlugin(Star):
     @filter.command("查收")
     @filter.custom_filter(ExplicitSlashCommand, False)
     async def check_student(self, event: AstrMessageEvent, query: str = ""):
+        if not event.is_private_chat():
+            yield make_reply(event, "个人作业状态请私聊机器人查询。")
+            return
         query = query.strip()
         sender_id = str(event.get_sender_id())
         is_ta = is_ta_or_admin(event)
@@ -1815,6 +1963,9 @@ class HomeworkPlugin(Star):
                     await reply(f"❌ 查询作业状态失败: {e}")
                 return
             elif s_type == "missing":
+                if not is_private or not is_ta_or_admin(event):
+                    await reply("未交学生名单仅限课程助教或管理员私聊查询。")
+                    return
                 target = options[text]
                 try:
                     data = api_get(f"/api/assignments/{target['id']}/missing")

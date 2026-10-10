@@ -113,7 +113,7 @@ def render_status_card(data: dict) -> str:
 def render_missing_list(data: dict) -> str:
     missing = data.get("missing_list") or []
     if not missing:
-        return f"🎉【{data['assignment_name']}】全员均已按时提交完成！"
+        return f"🎉【{data['assignment_name']}】目前没有未交学生。"
 
     lines = [f"📢【{data['assignment_name']}】未交作业学生名单（共 {len(missing)} 人）：", "━━━━━━━━━━━━━━━"]
     for idx, s in enumerate(missing, 1):
