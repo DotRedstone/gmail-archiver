@@ -160,12 +160,13 @@ def _looks_like_provider_error(text: str) -> bool:
 
 ASSISTANT_SYSTEM_PROMPT = """你是一个可靠、自然的 QQ 智能助手。默认用中文交流，正常回答问候、日常问题、学习讨论和课程相关问题；不要把每句话都引回作业或重复功能说明。
 
-你也可以使用课程作业技能：私聊上传压缩包、身份绑定、作业状态查询、导出、查重和课程管理。询问全班提交进度时调用 get_course_submission_status；需要实时课程数据时，优先调用已注册工具；不要猜测提交记录、截止时间或身份信息。
+你也可以使用课程作业技能：私聊上传压缩包、身份绑定、作业状态查询、导出、查重和课程管理。询问全班提交进度时调用 get_course_submission_status；询问本人作业时调用 get_my_homework_status；需要实时课程数据时，必须优先调用已注册工具，不能声称“没有工具”或改用无关工具。
 
 【身份与隐私】
 - 只有私聊且完成花名册核验的用户，才可通过 get_my_verified_identity 查询其自己的绑定身份；用户问“我是谁”“我的信息”时应调用该工具。
 - 群聊中不得推断、展示或确认任何人的学号、姓名、绑定状态或作业信息；即使有人问“我是谁”，也只能说明你无法在群里核验身份，并提示其私聊完成绑定后查询。
 - 普通学生只能查询本人；不得用任何工具向其披露他人的身份、作业或绑定信息。
+- 管理员私聊请求班级绑定名单或未绑定名单时，调用 send_course_roster 或 send_unbound_roster；工具会直接私密发送结果，不能在模型回复中复述名单。
 
 【回复风格】
 - 自然、友好、简洁，直接回答问题；不知道就坦诚说明。
@@ -334,6 +335,43 @@ class HomeworkPlugin(Star):
         student_id = str(binding.get("student_id", "")).strip()
         class_name = format_class_name(str(binding.get("class_name", "")), student_id)
         return f"当前私聊账号的已验证身份：姓名 {name}，学号 {student_id}，班级 {class_name}。"
+
+    @filter.llm_tool(name="get_my_homework_status")
+    async def tool_get_my_homework_status(self, event: AstrMessageEvent) -> str:
+        '''查询当前私聊已绑定用户本人的作业状态。用户问“我的作业”“我交了吗”时调用。'''
+        if not event.is_private_chat():
+            return "隐私保护：群聊中不能查询个人作业状态。请提醒用户私聊机器人后查询。"
+        return await self.tool_query_student(event, "我自己")
+
+    @filter.llm_tool(name="send_course_roster")
+    async def tool_send_course_roster(self, event: AstrMessageEvent, class_name: str = "") -> str:
+        '''向管理员私聊发送已绑定的班级人员名单。用户请求“班上人员名单”时调用。'''
+        if not event.is_private_chat():
+            return "隐私保护：班级人员名单不能在群里发送。请让管理员私聊机器人查询。"
+        if not is_admin(event):
+            return "权限不足：班级人员名单仅限课程助教或管理员查看。"
+        try:
+            roster_data = await async_api_get("/api/roster")
+            bindings_data = await async_api_get("/api/bindings")
+        except Exception:
+            return "暂时无法读取班级人员名单，请稍后重试。"
+        await event.send(make_reply(event, render_class_bindings_card(roster_data, bindings_data, class_name.strip())))
+        return "已通过私聊发送班级人员名单。不要在回复中复述名单内容。"
+
+    @filter.llm_tool(name="send_unbound_roster")
+    async def tool_send_unbound_roster(self, event: AstrMessageEvent, class_name: str = "") -> str:
+        '''向管理员私聊发送尚未绑定的学生名单。用户请求“未绑定名单”时调用。'''
+        if not event.is_private_chat():
+            return "隐私保护：未绑定名单不能在群里发送。请让管理员私聊机器人查询。"
+        if not is_admin(event):
+            return "权限不足：未绑定名单仅限课程助教或管理员查看。"
+        try:
+            roster_data = await async_api_get("/api/roster")
+            bindings_data = await async_api_get("/api/bindings")
+        except Exception:
+            return "暂时无法读取未绑定名单，请稍后重试。"
+        await event.send(make_reply(event, render_unbound_students_card(roster_data, bindings_data, class_name.strip())))
+        return "已通过私聊发送未绑定名单。不要在回复中复述名单内容。"
 
     @filter.llm_tool(name="query_student_homework")
     async def tool_query_student(self, event: AstrMessageEvent, student_name_or_id: str) -> str:
