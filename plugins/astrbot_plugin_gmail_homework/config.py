@@ -6,22 +6,16 @@ try:
 except ImportError:
     AstrMessageEvent = object
 
-# Keep deployment-specific values out of the plugin source.  Repeater injects
-# the API key into the AstrBot container at runtime.
-API_BASE = os.environ.get("GMAIL_ARCHIVER_API_BASE", "https://gmail.bdot.in").rstrip("/")
-API_KEY = os.environ.get("GMAIL_ARCHIVER_API_KEY", "").strip()
-SUPER_ADMIN_QQ = "1689491386"
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "plugin_config.json")
 
 def load_config() -> dict:
     default_cfg = {
         "class_groups": [],
         "teaching_assistants": [],
-        # Per-person daily model budget. Deterministic homework commands do not
-        # consume it. Keep this in the runtime config so it can be adjusted
-        # without editing plugin code.
+        # LLM is the normal conversation path. The threshold only raises a
+        # rate-limited operational alert; it never degrades a valid request.
         "conversation": {
-            "daily_llm_limit": 20,
+            "daily_llm_alert_threshold": 100,
             "alert_cooldown_seconds": 1800,
         },
     }
@@ -35,6 +29,19 @@ def load_config() -> dict:
         except Exception:
             pass
     return default_cfg
+
+
+# Deployment-specific endpoints and identifiers never belong in Git. Prefer
+# environment variables, but permit the deployment-owned plugin config so a
+# container can be upgraded without baking personal values into its image.
+_runtime_cfg = load_config()
+API_BASE = os.environ.get(
+    "GMAIL_ARCHIVER_API_BASE", str(_runtime_cfg.get("api_base", "https://archiver.example.invalid"))
+).rstrip("/")
+API_KEY = os.environ.get("GMAIL_ARCHIVER_API_KEY", "").strip()
+SUPER_ADMIN_QQ = os.environ.get(
+    "GMAIL_ARCHIVER_SUPER_ADMIN_QQ", str(_runtime_cfg.get("super_admin_qq", ""))
+).strip()
 
 def save_config(cfg: dict):
     try:
@@ -52,15 +59,15 @@ def get_conversation_policy() -> dict:
     if not isinstance(cfg, dict):
         cfg = {}
     try:
-        daily_llm_limit = max(1, int(cfg.get("daily_llm_limit", 20)))
+        daily_llm_alert_threshold = max(1, int(cfg.get("daily_llm_alert_threshold", 100)))
     except (TypeError, ValueError):
-        daily_llm_limit = 20
+        daily_llm_alert_threshold = 100
     try:
         alert_cooldown_seconds = max(60, int(cfg.get("alert_cooldown_seconds", 1800)))
     except (TypeError, ValueError):
         alert_cooldown_seconds = 1800
     return {
-        "daily_llm_limit": daily_llm_limit,
+        "daily_llm_alert_threshold": daily_llm_alert_threshold,
         "alert_cooldown_seconds": alert_cooldown_seconds,
     }
 
@@ -113,11 +120,11 @@ def remove_teaching_assistant(qq_id: str) -> bool:
     return False
 
 def is_super_admin(event: AstrMessageEvent) -> bool:
-    return str(event.get_sender_id() or "") == SUPER_ADMIN_QQ
+    return bool(SUPER_ADMIN_QQ) and str(event.get_sender_id() or "") == SUPER_ADMIN_QQ
 
 def is_ta_or_admin(event: AstrMessageEvent) -> bool:
     sender_id = str(event.get_sender_id() or "")
-    if sender_id == SUPER_ADMIN_QQ:
+    if SUPER_ADMIN_QQ and sender_id == SUPER_ADMIN_QQ:
         return True
     return sender_id in get_teaching_assistants()
 

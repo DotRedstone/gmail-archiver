@@ -112,7 +112,7 @@ USER_QUERY_COOLDOWN_SECONDS = 3.0
 MAX_PROMPT_CHARS = 1500
 
 FALLBACK_REPLY = (
-    "当前智能问答暂不可用，已切换为作业助手模式。\n"
+    "当前智能问答暂不可用，可先使用本地作业技能。\n"
     "可直接使用：/绑定 学号 姓名、/查收、/查作业、/未交、/帮助。"
 )
 
@@ -156,11 +156,13 @@ HOMEWORK_SYSTEM_PROMPT = """你是《并行计算》课程作业助手。
 2. 作业提交方式：指导学生直接私聊发送作业压缩包（.zip / .rar / .7z / .tar.gz），系统将自动核验并归档入库。
 3. 作业状态查询：指导学生使用「/查收 姓名」或直接回复「看看我交了吗」自助查询。
 4. 解答学生关于实验要求、打包格式、命名规范及作业提交相关的疑问。
+5. 对需要实时作业数据的问题，优先调用已注册的查询工具；不要臆造提交记录或截止时间。
+6. 确定性指令（绑定、上传、导出、权限管理）是本助手的技能入口，可在需要时指导用户使用相应指令。
 【回复规范】：
 - 语言风格：专业、简洁、直接、客观，严禁任何角色扮演、拟人化动作描写或冗余套话。
 - 若学生输入完全无关的话题，简明礼貌回复：“同学你好，本助手主要负责课程作业收集与查收指引，如需交作业请直接私聊发送作业压缩包。”"""
 
-@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.5.0")
+@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.6.0")
 class HomeworkPlugin(Star):
     def __init__(self, context):
         super().__init__(context)
@@ -171,7 +173,7 @@ class HomeworkPlugin(Star):
         if not claim_alert(alert_key, policy["alert_cooldown_seconds"]):
             return
         bot = getattr(event, "bot", None)
-        if not bot:
+        if not bot or not SUPER_ADMIN_QQ:
             return
         try:
             await bot.call_action(
@@ -219,7 +221,7 @@ class HomeworkPlugin(Star):
                 await event.send(make_reply(event,
                     "👋 首次私聊请先完成实名绑定，未绑定身份不会转入智能问答。\n"
                     "请发送：/绑定 学号 姓名\n"
-                    "例如：/绑定 240809010501 张三\n"
+                    "例如：/绑定 <学号> <姓名>\n"
                     "系统会通过课程花名册核验后再开放私聊功能。"
                 ))
                 return
@@ -255,21 +257,14 @@ class HomeworkPlugin(Star):
             await self._fallback(event, "per_minute")
             return
 
+        projected_daily_count = daily_llm_count(sender_id) + 1
         policy = get_conversation_policy()
-        used_today = daily_llm_count(sender_id)
-        if not is_admin(event) and used_today >= policy["daily_llm_limit"]:
+        if not is_admin(event) and projected_daily_count >= policy["daily_llm_alert_threshold"]:
             await self._notify_admin(
                 event,
-                f"daily_limit:{sender_id}",
-                f"QQ {sender_id} 已用完当日模型额度（{policy['daily_llm_limit']} 次），已自动降级为本地规则模式。",
+                f"daily_volume:{sender_id}",
+                f"QQ {sender_id} 当日模型请求已达 {projected_daily_count} 次（告警阈值：{policy['daily_llm_alert_threshold']}）；请求仍正常进入模型。",
             )
-            await self._fallback(
-                event,
-                "daily_limit",
-                f"今天的智能问答额度已用完（{policy['daily_llm_limit']} 次），已切换为作业助手模式。\n"
-                "可直接使用：/查收、/查作业、/未交、/帮助。",
-            )
-            return
 
         history.append(now)
         USER_QUERY_TIMESTAMPS[sender_id] = history
@@ -318,7 +313,7 @@ class HomeworkPlugin(Star):
         await self._notify_admin(
             event,
             "model_response_error",
-            f"模型响应异常，已为 QQ {sender_id} 自动降级为本地规则模式（群：{group_id or '私聊'}）。",
+            f"模型响应异常，已为 QQ {sender_id} 返回本地技能提示（群：{group_id or '私聊'}）。",
         )
 
     # [LLM Tools]
@@ -410,10 +405,10 @@ class HomeworkPlugin(Star):
             "2️⃣ 私聊直接发作业压缩包 —— 自动识别身份，秒级规范命名并安全归档入库\n"
             "3️⃣「查作业」—— 查看作业提交人数与整体进度\n"
             "4️⃣「未交」—— 查看当前未交作业名单\n"
-            "5️⃣ 绑定 <学号> <姓名> —— 绑定学生身份（例：绑定 240809010501 支全振）\n"
+            "5️⃣ 绑定 <学号> <姓名> —— 绑定学生身份\n"
             "6️⃣「我的信息」—— 查看当前绑定的学号、姓名与班级\n\n"
             "👑【助教/管理员专属】：\n"
-            "• 查收 <姓名或学号> —— 直接查询指定同学作业（例：查收 支全振）\n"
+            "• 查收 <姓名或学号> —— 直接查询指定同学作业\n"
             "• 指定绑定 <QQ> <学号> [姓名] —— 直接为指定学生代绑身份\n"
             "• 解绑 <QQ/学号/姓名> —— 解除指定学生的身份绑定（学生无权自主解绑）\n"
             "• 导出作业 / 导出整学期 —— 打包下载全员作业归档压缩包\n"
@@ -452,7 +447,7 @@ class HomeworkPlugin(Star):
             "━━━━━━━━━━━━━━━",
             f"消息总数：{totals.get('message', 0)}",
             f"模型请求：{totals.get('llm', 0)}",
-            f"规则降级：{totals.get('regex', 0)}",
+            f"本地技能处理：{totals.get('regex', 0)}",
             f"未绑定拦截：{totals.get('unbound_blocked', 0)}",
             f"群聊策略拦截：{totals.get('group_blocked', 0)}",
             f"频率限流：{totals.get('rate_limited', 0)}",
@@ -485,7 +480,7 @@ class HomeworkPlugin(Star):
             yield make_reply(event,
                 "💡【助教指定绑定用法】\n"
                 "• /指定绑定 <目标QQ> <学号> [姓名]\n"
-                "例如：/指定绑定 1689491386 240809010501 支全振\n"
+                "例如：/指定绑定 <目标QQ> <学号> <姓名>\n"
                 "（姓名可选填，系统会自动从花名册校验并补齐班级与姓名）"
             )
             return
@@ -510,12 +505,12 @@ class HomeworkPlugin(Star):
                     "💡【绑定用法说明】\n"
                     "• 本人绑定：/绑定 <学号> <姓名>\n"
                     "• 助教代绑：/绑定 <目标QQ> <学号> [姓名]\n"
-                    "例如：/绑定 1689491386 240809010501 支全振"
+                    "例如：/绑定 <目标QQ> <学号> <姓名>"
                 )
             else:
                 yield make_reply(event, 
                     "💡 用法：/绑定 <学号> <姓名>\n"
-                    "例如：/绑定 240809010501 支全振\n"
+                    "例如：/绑定 <学号> <姓名>\n"
                     "（绑定身份后，直接私聊把作业压缩包发给机器人即可自动秒级入库！）"
                 )
             return
@@ -546,7 +541,7 @@ class HomeworkPlugin(Star):
                 yield make_reply(event,
                     "⚠️ 为核验身份，请同时提供学号和姓名。\n"
                     "用法：/绑定 <学号> <姓名>\n"
-                    "例如：/绑定 240809010501 张三"
+                    "例如：/绑定 <学号> <姓名>"
                 )
                 return
             student_id = parts[0]
@@ -612,7 +607,7 @@ class HomeworkPlugin(Star):
         if resp.get("error"):
             yield make_reply(event, 
                 "❓ 你当前尚未绑定学生身份。\n"
-                "👉 请回复：/绑定 学号 姓名（例如：/绑定 240809010501 支全振）进行绑定。"
+                "👉 请回复：/绑定 学号 姓名进行绑定。"
             )
             return
 
@@ -645,7 +640,7 @@ class HomeworkPlugin(Star):
                 "• /解绑 <QQ号>\n"
                 "• /解绑 <学号>\n"
                 "• /解绑 <姓名>\n"
-                "例如：/解绑 1689491386 或 /解绑 240809010501 或 /解绑 支全振"
+                "例如：/解绑 <QQ> 或 /解绑 <学号> 或 /解绑 <姓名>"
             )
             return
 
@@ -999,7 +994,7 @@ class HomeworkPlugin(Star):
         if not query:
             if not has_binding:
                 if is_ta:
-                    yield make_reply(event, "💡 用法：/查收 <姓名或学号> [作业序号]，例如：/查收 支全振 或 /查收 支全振 2")
+                    yield make_reply(event, "💡 用法：/查收 <姓名或学号> [作业序号]")
                 else:
                     yield make_reply(event, "💡 你尚未绑定学生身份。请先发送「/绑定 学号 姓名」完成绑定，或直接私聊发送作业压缩包。")
                 return
@@ -1017,7 +1012,7 @@ class HomeworkPlugin(Star):
                         student_query = my_sid
                     else:
                         if is_ta:
-                            yield make_reply(event, f"💡 请指定要查询的学生姓名或学号，例如：/查收 支全振 {p0}")
+                            yield make_reply(event, f"💡 请指定要查询的学生姓名或学号，例如：/查收 <姓名或学号> {p0}")
                         else:
                             yield make_reply(event, "💡 你尚未绑定学生身份。请先发送「/绑定 学号 姓名」完成绑定。")
                         return
@@ -1516,7 +1511,7 @@ class HomeworkPlugin(Star):
         if s_type == "bind_and_submit":
             sid, student_name = _parse_student_identity(text)
             if not sid or not student_name:
-                await reply("⚠️ 为核验身份，请回复“学号 姓名”（例如：240809010501 张三），回复 取消 可退出本次提交。")
+                await reply("⚠️ 为核验身份，请回复“学号 姓名”，回复 取消 可退出本次提交。")
                 event.stop_event()
                 return
 
@@ -1603,7 +1598,7 @@ class HomeworkPlugin(Star):
         if s_type == "bind_and_chat":
             sid, student_name = _parse_student_identity(text)
             if not sid or not student_name:
-                await reply("⚠️ 为核验身份，请回复“学号 姓名”（例如：240809010501 张三），回复 取消 退出。")
+                await reply("⚠️ 为核验身份，请回复“学号 姓名”，回复 取消 退出。")
                 event.stop_event()
                 return
 
@@ -1634,7 +1629,7 @@ class HomeworkPlugin(Star):
         if s_type == "bind_and_report_status":
             sid, student_name = _parse_student_identity(text)
             if not sid or not student_name:
-                await reply("⚠️ 为核验身份，请回复“学号 姓名”（例如：240809010501 张三），回复 取消 退出。")
+                await reply("⚠️ 为核验身份，请回复“学号 姓名”，回复 取消 退出。")
                 event.stop_event()
                 return
 
@@ -1888,7 +1883,7 @@ class HomeworkPlugin(Star):
                     await reply(
                         "🔐 查询个人作业前请先完成实名绑定。\n"
                         "请发送：/绑定 学号 姓名\n"
-                        "例如：/绑定 240809010501 张三"
+                        "例如：/绑定 <学号> <姓名>"
                     )
                     return
                 else:

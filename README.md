@@ -117,9 +117,9 @@ go build -o bin/gmail-archiver cmd/server/main.go
 - 示例内容：
   ```csv
   学号,姓名,班级,性别
-  240809010501,支全振,2024级计算机科学与技术5班,男
-  240809010502,马祥宇,2024级计算机科学与技术5班,男
-  240809010506,王鹏宇,2024级计算机科学与技术5班,男
+  <学号>,<姓名>,<班级>,<性别>
+  <示例学号1>,<示例姓名1>,<示例班级>,<示例性别>
+  <示例学号2>,<示例姓名2>,<示例班级>,<示例性别>
   ```
 
 ### 2. 配置作业规则（YAML）
@@ -194,7 +194,7 @@ curl -s "http://localhost:8080/api/assignments/parallel_computing_lab1/export?to
 #### 场景 2：单次作业指定学生单独下载
 单人复查某次作业时，直接下载该学生提交的最新文件（以规范文件名流式下载）：
 ```bash
-curl -s "http://localhost:8080/api/assignments/parallel_computing_lab1/submissions/240809010501/download?token=your_token" -O
+curl -s "http://localhost:8080/api/assignments/parallel_computing_lab1/submissions/<student-id>/download?token=your_token" -O
 ```
 
 #### 场景 3：整学期全部作业全员总打包 (Zip)
@@ -206,7 +206,7 @@ curl -s "http://localhost:8080/api/assignments/export/all?token=your_token" -o �
 #### 场景 4：单人纵向全学期所有作业总打包 (Zip)
 期末复查某位学生平时成绩时，纵向提取该学生截止目前提交的全部课程作业，打包为 `{学号}_{姓名}_全部作业.zip`：
 ```bash
-curl -s "http://localhost:8080/api/students/240809010501/export?token=your_token" -o 240809010501_支全振_全部作业.zip
+curl -s "http://localhost:8080/api/students/<student-id>/export?token=your_token" -o student_all_assignments.zip
 ```
 
 ---
@@ -243,7 +243,7 @@ curl -s "http://localhost:8080/api/assignments/parallel_computing_lab1/missing?t
 
 #### 查看单个学生提交历史（版本更正核验与时间线）
 ```bash
-curl -s "http://localhost:8080/api/assignments/parallel_computing_lab1/submissions/240809010501/history?token=your_token" | jq .
+curl -s "http://localhost:8080/api/assignments/parallel_computing_lab1/submissions/<student-id>/history?token=your_token" | jq .
 ```
 可查看到该学生历次提交的时间、对应文件名及当前唯一有效的版本（`is_latest = true`）。
 
@@ -256,8 +256,8 @@ curl -s "http://localhost:8080/api/assignments/parallel_computing_lab1/submissio
 - 在班级群发送 `/催交` 自动列出未交名单；
 - 学生私聊机器人发送 `/我的作业` 查询收件状态。
 
-完整选型分析（基于 **NapCatQQ + OneBot v11** 的无头 QQ 小号方案）与开箱即用的 Python 联动脚本，详见文档：
-👉 [QQ 机器人对接指南 (docs/QQ_BOT_INTEGRATION.md)](file:///home/dot/Projects/gmail-archiver/docs/QQ_BOT_INTEGRATION.md)
+完整集成方案（基于 **SnowLuma + OneBot v11 + AstrBot**）与隐私边界，详见文档：
+👉 [QQ 机器人对接指南](docs/QQ_BOT_INTEGRATION.md)
 
 ---
 
