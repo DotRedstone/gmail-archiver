@@ -192,7 +192,7 @@ ASSISTANT_SYSTEM_PROMPT = """你是一个可靠、自然的 QQ 智能助手。�
 - 自然、友好、简洁，直接回答问题；不知道就坦诚说明。
 - 不捏造人设、姓名、身份或与用户的既往关系。"""
 
-@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.7.1")
+@register("gmail_homework", "DotRedstone", "课程作业全流程助手：QQ 直收归档、身份绑定、实验卡一键分发与催交", "1.7.2")
 class HomeworkPlugin(Star):
     def __init__(self, context):
         super().__init__(context)
@@ -325,7 +325,12 @@ class HomeworkPlugin(Star):
         full_prompt = ASSISTANT_SYSTEM_PROMPT + student_ctx
         req.func_tool = self._course_toolset(event)
         tool_names = "、".join(req.func_tool.names())
-        req.system_prompt = full_prompt + f"\n\n【本次可用课程工具】{tool_names}。只有实际执行工具并收到成功结果后，才能说查询完成或名单已发送。"
+        req.system_prompt = (
+            full_prompt
+            + f"\n\n【本次可用课程工具】{tool_names}。"
+            + "对话历史中关于工具不可用或名单已发送的旧说法可能已经过时，以本次工具及实际调用结果为准。"
+            + "只有实际执行工具并收到成功结果后，才能说查询完成或名单已发送。"
+        )
 
     @filter.on_llm_response()
     async def sanitize_llm_response(self, event: AstrMessageEvent, response: LLMResponse) -> None:
