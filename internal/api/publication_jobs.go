@@ -16,12 +16,22 @@ func (s *Server) handleDuePublicationJobs(w http.ResponseWriter, r *http.Request
 		writeJSONError(w, http.StatusBadRequest, "invalid platform or bot identity")
 		return
 	}
+	// Coordinate with confirmation/projection repair in this process.
+	s.publicationMu.Lock()
+	defer s.publicationMu.Unlock()
 	jobs, err := s.database.DuePublicationJobs(platform, bot, time.Now().UTC())
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to read publication jobs")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+	ready := make([]*db.PublicationJob, 0, len(jobs))
+	for _, job := range jobs {
+		card, err := s.database.GetLabCardDraftByID(job.DraftID)
+		if err == nil && s.publicationProjectionReady(card) {
+			ready = append(ready, job)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": ready})
 }
 
 func (s *Server) handleClaimPublicationJob(w http.ResponseWriter, r *http.Request) {
@@ -40,6 +50,18 @@ func (s *Server) handleClaimPublicationJob(w http.ResponseWriter, r *http.Reques
 	if !externalIDPattern.MatchString(id) {
 		writeJSONError(w, http.StatusBadRequest, "invalid job id")
 		return
+	}
+	// Recheck the durable projection at claim time; a job listed before
+	// a restart or a lost rule file must never become externally sendable.
+	s.publicationMu.Lock()
+	defer s.publicationMu.Unlock()
+	current, err := s.database.GetPublicationJob(id)
+	if err == nil && current.PlatformID == req.PlatformID && current.BotID == req.BotID {
+		card, cardErr := s.database.GetLabCardDraftByID(current.DraftID)
+		if cardErr != nil || !s.publicationProjectionReady(card) {
+			writeJSONError(w, http.StatusServiceUnavailable, "assignment projection unavailable")
+			return
+		}
 	}
 	job, err := s.database.ClaimPublicationJob(id, req.PlatformID, req.BotID, time.Now().UTC())
 	if errors.Is(err, db.ErrNotFound) {

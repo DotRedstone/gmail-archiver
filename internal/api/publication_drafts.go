@@ -17,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/dot/gmail-archiver/internal/db"
+	"github.com/dot/gmail-archiver/internal/roster"
 	"github.com/dot/gmail-archiver/internal/rule"
 )
 
@@ -107,7 +108,7 @@ func (s *Server) handleGetPublicationDraft(w http.ResponseWriter, r *http.Reques
 	status := "draft"
 	if card.Status == "confirmed" {
 		status, err = s.database.PublishedAssignmentStatus(assignmentID, card.DraftID)
-		if errors.Is(err, db.ErrNotFound) && len(card.Targets) == 0 {
+		if errors.Is(err, db.ErrNotFound) && card.DeliveryStatus == "manual_pending" {
 			status, err = "manual_pending", nil
 		}
 		if err != nil {
@@ -153,6 +154,10 @@ func (s *Server) handleUpdatePublicationDraft(w http.ResponseWriter, r *http.Req
 			card.Targets, card.RosterSnapshot, card.ExpectedCount = nil, nil, 0
 		} else {
 			targets, snapshot, err := s.snapshotPublicationTargets(*req.Targets)
+			if errors.Is(err, errRosterUnavailable) {
+				writeJSONError(w, http.StatusServiceUnavailable, "course roster unavailable")
+				return
+			}
 			if err != nil {
 				writeJSONError(w, http.StatusBadRequest, "invalid publication targets or roster")
 				return
@@ -240,7 +245,7 @@ func (s *Server) handleConfirmPublicationDraft(w http.ResponseWriter, r *http.Re
 		return
 	}
 	assignmentID := fmt.Sprintf("experiment_%d", card.Number)
-	if card.Status == "confirmed" && len(card.Targets) == 0 {
+	if card.Status == "confirmed" && card.DeliveryStatus == "manual_pending" {
 		writeJSONError(w, http.StatusConflict, "legacy card requires manual publication")
 		return
 	}
@@ -264,14 +269,29 @@ func (s *Server) handleConfirmPublicationDraft(w http.ResponseWriter, r *http.Re
 	if card.Status == "draft" {
 		if _, err := s.database.ConfirmLabCardWithJobs(*card, assignmentID, time.Now().UTC()); err != nil {
 			current, lookupErr := s.database.GetLabCardDraft(card.Number)
-			if lookupErr != nil || current.Status != "confirmed" || current.DraftID != card.DraftID {
+			if lookupErr != nil || current.Status != "confirmed" || current.DraftID != card.DraftID ||
+				current.DeliveryStatus != "not_started" {
 				writeJSONError(w, http.StatusConflict, "assignment or publication jobs could not be committed")
 				return
 			}
-			card = current
 		}
 	}
-	if _, exists := s.rules.GetRule(assignmentID); !exists {
+	card, err := s.database.GetLabCardDraft(card.Number)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "publication state unavailable")
+		return
+	}
+	if card.DeliveryStatus != "not_started" {
+		writeJSONError(w, http.StatusConflict, "legacy card requires manual publication")
+		return
+	}
+	if _, err := s.database.PublishedAssignmentStatus(assignmentID, card.DraftID); err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "publication state unavailable")
+		return
+	}
+	// Rebuild missing or stale disk projections even when the in-memory rule
+	// still exists. A persisted ready flag alone must not authorize delivery.
+	if !s.publicationProjectionReady(card) {
 		if _, err := s.writePublicationRoster(card); err != nil {
 			writeJSONError(w, http.StatusServiceUnavailable, "publication is preparing; roster snapshot unavailable")
 			return
@@ -289,6 +309,10 @@ func (s *Server) handleConfirmPublicationDraft(w http.ResponseWriter, r *http.Re
 			writeJSONError(w, http.StatusServiceUnavailable, "publication is preparing; assignment rule unavailable")
 			return
 		}
+	}
+	if !s.publicationProjectionReady(card) {
+		writeJSONError(w, http.StatusServiceUnavailable, "publication is preparing; projection unavailable")
+		return
 	}
 	if err := s.database.MarkPublishedAssignmentReady(assignmentID, card.DraftID, time.Now().UTC()); err != nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "publication is preparing; retry confirmation")
@@ -316,4 +340,53 @@ func decodePublicationTargets(raw string) ([]db.PublicationTarget, error) {
 		return nil, err
 	}
 	return targets, nil
+}
+
+// publicationProjectionReady validates both the loaded rule and its durable
+// rule/roster files against the immutable draft snapshot. The database's
+// "ready" bit records preparation, not a guarantee that files remain present.
+func (s *Server) publicationProjectionReady(card *db.LabCardDraft) bool {
+	if card == nil || card.Status != "confirmed" || card.DeliveryStatus != "not_started" ||
+		card.DraftID == "" || len(card.RosterSnapshot) == 0 || len(card.Targets) == 0 ||
+		s.rules == nil || s.cfg == nil || s.cfg.DataDir == "" {
+		return false
+	}
+	assignmentID := fmt.Sprintf("experiment_%d", card.Number)
+	r, ok := s.rules.GetRule(assignmentID)
+	rosterPath := filepath.ToSlash(filepath.Join("rosters", "snapshots", card.DraftID+".csv"))
+	expectedFilename := fmt.Sprintf("实验%d-{class}-{student_id}-{name}.zip", card.Number)
+	if !ok || !r.Deadline.Equal(card.Deadline) || r.TargetFilename != expectedFilename ||
+		len(r.RosterPaths) != 1 || r.RosterPaths[0] != rosterPath {
+		return false
+	}
+	rulesDir := s.cfg.RulesDir
+	if rulesDir == "" {
+		rulesDir = filepath.Join(s.cfg.DataDir, "rules")
+	}
+	info, err := os.Stat(filepath.Join(rulesDir, assignmentID+".yaml"))
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	list := roster.New()
+	students, err := list.LoadCSV(filepath.Join(s.cfg.DataDir, filepath.FromSlash(rosterPath)))
+	if err != nil || len(students) != len(card.RosterSnapshot) {
+		return false
+	}
+	expected := make(map[string]db.SnapshotStudent, len(card.RosterSnapshot))
+	for _, student := range card.RosterSnapshot {
+		if _, exists := expected[student.StudentID]; exists {
+			return false
+		}
+		expected[student.StudentID] = student
+	}
+	for _, student := range students {
+		want, exists := expected[student.StudentID]
+		loaded, included := r.Roster.FindByID(student.StudentID)
+		if !exists || !included || student.Name != want.StudentName || student.ClassName != want.ClassName ||
+			loaded.Name != want.StudentName || loaded.ClassName != want.ClassName {
+			return false
+		}
+		delete(expected, student.StudentID)
+	}
+	return len(expected) == 0
 }

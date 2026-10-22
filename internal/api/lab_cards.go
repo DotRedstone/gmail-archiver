@@ -91,6 +91,12 @@ func (s *Server) handleLabCardUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid experiment number")
 		return
 	}
+	if s.rules != nil {
+		if _, exists := s.rules.GetRule(fmt.Sprintf("experiment_%d", number)); exists {
+			writeJSONError(w, http.StatusConflict, "experiment number already has a draft or assignment")
+			return
+		}
+	}
 	if _, err := s.database.GetLabCardDraft(number); err == nil {
 		writeJSONError(w, http.StatusConflict, "experiment number already has a draft or assignment")
 		return
@@ -126,6 +132,10 @@ func (s *Server) handleLabCardUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		targets, snapshot, err = s.snapshotPublicationTargets(targets)
+		if errors.Is(err, errRosterUnavailable) {
+			writeJSONError(w, http.StatusServiceUnavailable, "course roster unavailable")
+			return
+		}
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, "invalid publication targets or roster")
 			return
