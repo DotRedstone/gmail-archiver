@@ -237,3 +237,62 @@ target_filename: "实验1-{class}-{student_id}-{name}.{ext}"
 		t.Fatalf("deleted binding returned %d", rec.Code)
 	}
 }
+
+
+func TestBindingIntentRosterClassDriftAndUnavailable(t *testing.T) {
+	root := t.TempDir()
+	rosterDir := filepath.Join(root, "rosters")
+	if err := os.Mkdir(rosterDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rosterFile := filepath.Join(rosterDir, "course.csv")
+	writeRoster := func(className string) {
+		t.Helper()
+		if err := os.WriteFile(rosterFile, []byte("学号,姓名,班级\n990000000001,示例甲,"+className+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeRoster("示例班A")
+	database, err := db.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	files, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(&config.Config{APIKey: "synthetic-secret", DataDir: root}, database, files, nil, rule.NewEngine(root)).Routes()
+	request := func(path, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("X-API-Key", "synthetic-secret")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	claim := `{"platform_id":"course-qq","bot_id":"bot-example","external_user_id":"user-one","student_id":"990000000001","student_name":"示例甲"}`
+	key := `{"platform_id":"course-qq","bot_id":"bot-example","external_user_id":"user-one"}`
+	if rec := request("/api/v3/binding-intents", claim); rec.Code != http.StatusCreated {
+		t.Fatalf("intent: %d: %s", rec.Code, rec.Body.String())
+	}
+	if err := os.Remove(rosterFile); err != nil {
+		t.Fatal(err)
+	}
+	if rec := request("/api/v3/binding-intents/confirm", key); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unavailable roster was treated as a mismatch: %d", rec.Code)
+	}
+	writeRoster("示例班B")
+	if rec := request("/api/v3/binding-intents/confirm", key); rec.Code != http.StatusConflict {
+		t.Fatalf("changed class accepted without new confirmation: %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := database.GetExternalBinding("course-qq", "bot-example", "user-one"); err != db.ErrNotFound {
+		t.Fatalf("class drift created binding: %v", err)
+	}
+	if rec := request("/api/v3/binding-intents", claim); rec.Code != http.StatusCreated {
+		t.Fatalf("new intent for refreshed roster should only fail name/class mismatch when changed: %d", rec.Code)
+	}
+	if rec := request("/api/v3/binding-intents/confirm", key); rec.Code != http.StatusOK {
+		t.Fatalf("confirmed after new roster check: %d: %s", rec.Code, rec.Body.String())
+	}
+}

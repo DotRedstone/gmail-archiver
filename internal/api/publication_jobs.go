@@ -27,7 +27,11 @@ func (s *Server) handleDuePublicationJobs(w http.ResponseWriter, r *http.Request
 	ready := make([]*db.PublicationJob, 0, len(jobs))
 	for _, job := range jobs {
 		card, err := s.database.GetLabCardDraftByID(job.DraftID)
-		if err == nil && s.publicationProjectionReady(card) {
+		if err != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "publication state unavailable")
+			return
+		}
+		if s.publicationProjectionReady(card) {
 			ready = append(ready, job)
 		}
 	}

@@ -259,6 +259,18 @@ func TestScopedPublicationDraftJobs(t *testing.T) {
 	if fileJob.JobID == "" || noticeJob.JobID == "" {
 		t.Fatal("immediate jobs missing")
 	}
+	if rec := call(http.MethodPost, "/api/v3/publication-jobs/"+fileJob.JobID+"/result",
+		`{"platform_id":"course-qq","bot_id":"bot-example","status":"sent","message_id":"forged"}`, "application/json"); rec.Code != http.StatusConflict {
+		t.Fatalf("unclaimed job was marked sent: %d", rec.Code)
+	}
+	if rec := call(http.MethodPost, "/api/v3/publication-jobs/"+fileJob.JobID+"/claim",
+		`{"platform_id":"course-qq","bot_id":"another-bot"}`, "application/json"); rec.Code != http.StatusConflict {
+		t.Fatalf("other bot claimed job: %d", rec.Code)
+	}
+	if rec := call(http.MethodPost, "/api/v3/publication-jobs/"+fileJob.JobID+"/result",
+		`{"platform_id":"course-qq","bot_id":"bot-example","status":"failed"}`, "application/json"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("failure without category accepted: %d", rec.Code)
+	}
 	if rec := call(http.MethodGet, "/api/v3/publication-jobs?platform_id=course-qq&bot_id=bot-example", "", ""); rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(fileJob.JobID)) {
 		t.Fatalf("due jobs: %d: %s", rec.Code, rec.Body.String())
 	}
@@ -269,11 +281,22 @@ func TestScopedPublicationDraftJobs(t *testing.T) {
 	if rec := call(http.MethodGet, "/api/v3/publication-jobs?platform_id=course-qq&bot_id=bot-example", "", ""); bytes.Contains(rec.Body.Bytes(), []byte(fileJob.JobID)) {
 		t.Fatalf("claimed job was repolled: %s", rec.Body.String())
 	}
+	if rec := call(http.MethodPost, "/api/v3/publication-jobs/"+fileJob.JobID+"/claim", claim, "application/json"); rec.Code != http.StatusConflict {
+		t.Fatalf("claimed job was re-claimed: %d", rec.Code)
+	}
+	if rec := call(http.MethodPost, "/api/v3/publication-jobs/"+fileJob.JobID+"/result",
+		`{"platform_id":"course-qq","bot_id":"bot-example","status":"sent"}`, "application/json"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing platform receipt marked sent: %d", rec.Code)
+	}
 	ack := `{"platform_id":"course-qq","bot_id":"bot-example","status":"sent","message_id":"synthetic-message"}`
 	for i := 0; i < 2; i++ {
 		if rec := call(http.MethodPost, "/api/v3/publication-jobs/"+fileJob.JobID+"/result", ack, "application/json"); rec.Code != http.StatusOK {
 			t.Fatalf("ack %d: %d: %s", i, rec.Code, rec.Body.String())
 		}
+	}
+	if rec := call(http.MethodPost, "/api/v3/publication-jobs/"+fileJob.JobID+"/result",
+		`{"platform_id":"course-qq","bot_id":"bot-example","status":"sent","message_id":"different"}`, "application/json"); rec.Code != http.StatusConflict {
+		t.Fatalf("conflicting retry overwrote sent receipt: %d", rec.Code)
 	}
 	if rec := call(http.MethodPost, "/api/v3/publication-jobs/"+noticeJob.JobID+"/claim", claim, "application/json"); rec.Code != http.StatusOK {
 		t.Fatalf("notice claim: %d: %s", rec.Code, rec.Body.String())
@@ -281,6 +304,9 @@ func TestScopedPublicationDraftJobs(t *testing.T) {
 	unknown := `{"platform_id":"course-qq","bot_id":"bot-example","status":"unknown","failure_category":"timeout"}`
 	if rec := call(http.MethodPost, "/api/v3/publication-jobs/"+noticeJob.JobID+"/result", unknown, "application/json"); rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"failure_category":"timeout"`)) {
 		t.Fatalf("unknown receipt was lost: %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := call(http.MethodGet, "/api/v3/publication-jobs?platform_id=course-qq&bot_id=bot-example", "", ""); bytes.Contains(rec.Body.Bytes(), []byte(noticeJob.JobID)) {
+		t.Fatalf("unknown delivery was automatically requeued: %s", rec.Body.String())
 	}
 	manual := `{"platform_id":"course-qq","bot_id":"bot-example","status":"manual_pending","failure_category":"dependency_unknown"}`
 	if rec := call(http.MethodPost, "/api/v3/publication-jobs/"+noticeJob.JobID+"/result", manual, "application/json"); rec.Code != http.StatusOK {

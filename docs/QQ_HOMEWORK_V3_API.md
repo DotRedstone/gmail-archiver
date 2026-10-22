@@ -11,7 +11,7 @@
 | 接口 | 行为 |
 | --- | --- |
 | `POST /binding-intents` | 依据课程花名册核对学号和姓名，创建五分钟待确认状态；只返回必要的确认信息。 |
-| `GET /binding-intents` | 受信插件查询某平台账号的待确认状态；过期返回 410。 |
+| `GET /binding-intents` | 受信插件查询某平台账号的待确认状态；过期返回 410；并发创建新意向不会被旧意向的过期清理误删。 |
 | `POST /binding-intents/confirm` | 再核对花名册，在事务中消费意向并建立唯一绑定。来源固定为 `self_asserted`。 |
 | `POST /binding-intents/cancel` | 取消该平台账号的待确认状态。 |
 | `GET /bindings` | 按完整平台身份键或学号查询；无参数仅供受信管理客户端列出绑定。 |
@@ -36,7 +36,7 @@
 
 `GET /api/v3/publication-drafts/{draft_id}` 返回 `card`、`assignment_id`、`publication_status`（`draft`、`preparing`、`ready`）和 `jobs`。未确认时可用 `PATCH` 提交 `deadline` 和/或 `targets` 修改截止与范围，或用 `DELETE` 取消；确认后两者返回 409。`GET /api/v3/lab-cards/{number}` 和 `GET .../download` 保留按实验号查草稿与下载实验卡的接口。班群登记、停用及群 OpenID 的权威来源是插件受限账本；后端只接受插件显式提交的目标快照，不把“所有活动群”推断为发布范围。插件发送前还须复核目标群仍启用；停用群写回 `group_disabled`，不得转发到其他群。
 
-`POST /api/v3/publication-drafts/{draft_id}/confirm` 要求目标群与班级范围非空、预期学生数大于零、提醒时刻尚未过去。数据库在同一事务内固定草稿、`experiment_N` 发布记录和每群 `file`、`notice`、`reminder` 三项投递任务；不同草稿占用同一实验号会冲突。作业规则与快照 CSV 是数据库提交后的可重建投影；只有投影就绪并标记 `ready` 后，任务才能被领取。若投影失败，状态保留 `preparing`，重试同一确认可恢复，不能直接发群。重复确认只返回同一作业、目标快照和稳定 `job_id`，不创建新任务。返回 200 表示作业规则已准备好，**不表示 QQ 已收到消息或文件**。
+`POST /api/v3/publication-drafts/{draft_id}/confirm` 要求目标群与班级范围非空、预期学生数大于零、提醒时刻尚未过去。数据库在同一事务内固定草稿、`experiment_N` 发布记录和每群 `file`、`notice`、`reminder` 三项投递任务；不同草稿占用同一实验号会冲突。作业规则与快照 CSV 是数据库提交后的可重建投影；只有投影就绪并标记 `ready` 后，任务才能被领取。若投影失败，状态保留 `preparing`，重试同一确认可恢复，不能直接发群。重复确认只返回同一作业、目标快照和稳定 `job_id`，不创建新任务。如果已标记 ready 的规则文件或名单投影丢失，任务列表和领取入口会拒绝将任务交给插件；再次确认会从数据库快照修复投影，期间不会生成第二批任务。返回 200 表示作业规则已准备好，**不表示 QQ 已收到消息或文件**。
 
 `GET /api/v3/publication-jobs?platform_id=<...>&bot_id=<...>` 只列当前机器人已到期且仍为 `pending` 的任务。插件外发前用 `POST /api/v3/publication-jobs/{job_id}/claim` 传 `platform_id`、`bot_id`；后端原子记为 `unknown/interrupted`，避免进程崩溃后盲目重发。随后用 `POST .../{job_id}/result` 传相同身份键、`status`，`sent` 须带 `message_id`；其他结果须带白名单 `failure_category`。状态可为 `sent`、`failed`、`unknown`、`skipped`、`expired`、`manual_pending`；类别包括 `platform_rejected`、`quota`、`timeout`、`interrupted`、`missing_receipt`、`group_disabled`、`already_complete`、`admins_only_missing`、`roster_unavailable`、`dependency_unknown`、`deadline_passed`、`other`。重复提交同一结果幂等；`unknown` 不自动返回待发队列。截止前提醒只针对快照群；若规则准备太迟，已过提醒时刻的任务记为 `expired/deadline_passed`。平台消息 ID 仅是接口回执，不证明群成员已读。
 
