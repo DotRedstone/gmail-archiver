@@ -392,6 +392,73 @@ func TestPublicationRuleProjectionCanResumeWithoutResending(t *testing.T) {
 	if rec := call(http.MethodGet, "/api/v3/publication-jobs?platform_id=course-qq&bot_id=bot-example"); rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"kind":"file"`)) {
 		t.Fatalf("ready jobs unavailable: %d: %s", rec.Code, rec.Body.String())
 	}
+	jobs, err := database.ListPublicationJobs(card.DraftID)
+	if err != nil || len(jobs) != 3 {
+		t.Fatalf("expected exactly three stable delivery jobs: %d, %v", len(jobs), err)
+	}
+	var fileJob *db.PublicationJob
+	for _, job := range jobs {
+		if job.Kind == "file" {
+			fileJob = job
+		}
+	}
+	if fileJob == nil {
+		t.Fatal("missing file delivery job")
+	}
+	claim := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v3/publication-jobs/"+fileJob.JobID+"/claim",
+			bytes.NewBufferString(`{"platform_id":"course-qq","bot_id":"bot-example"}`))
+		req.Header.Set("X-API-Key", "synthetic-secret")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	snapshotFile := filepath.Join(root, "rosters", "snapshots", card.DraftID+".csv")
+	if err := os.Remove(snapshotFile); err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(http.MethodGet, "/api/v3/publication-jobs?platform_id=course-qq&bot_id=bot-example"); bytes.Contains(rec.Body.Bytes(), []byte(fileJob.JobID)) {
+		t.Fatalf("missing projection still advertised a job: %s", rec.Body.String())
+	}
+	if rec := claim(); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("missing projection allowed claim: %d: %s", rec.Code, rec.Body.String())
+	}
+	if pending, err := database.GetPublicationJob(fileJob.JobID); err != nil || pending.Status != "pending" {
+		t.Fatalf("failed claim changed durable state: %+v %v", pending, err)
+	}
+	if rec := call(http.MethodPost, path+"/confirm"); rec.Code != http.StatusOK {
+		t.Fatalf("rebuilding lost ready projection: %d: %s", rec.Code, rec.Body.String())
+	}
+	after, err := database.ListPublicationJobs(card.DraftID)
+	if err != nil || len(after) != len(jobs) {
+		t.Fatalf("reconfirmation duplicated jobs: %d %v", len(after), err)
+	}
+	for i := range jobs {
+		if after[i].JobID != jobs[i].JobID {
+			t.Fatalf("job ID changed across recovery: %s -> %s", jobs[i].JobID, after[i].JobID)
+		}
+	}
+	if rec := claim(); rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"status":"unknown"`)) {
+		t.Fatalf("claim should persist unknown/interrupted: %d: %s", rec.Code, rec.Body.String())
+	}
+	reopened, err := db.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	unknown, err := reopened.GetPublicationJob(fileJob.JobID)
+	if err != nil || unknown.Status != "unknown" || unknown.FailureCategory != "interrupted" {
+		t.Fatalf("restart did not preserve unknown state: %+v %v", unknown, err)
+	}
+	pending, err := reopened.DuePublicationJobs("course-qq", "bot-example", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range pending {
+		if job.JobID == fileJob.JobID {
+			t.Fatal("interrupted claimed job was automatically requeued")
+		}
+	}
 }
 
 func TestLabCardFormatValidation(t *testing.T) {

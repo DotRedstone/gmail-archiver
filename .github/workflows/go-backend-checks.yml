@@ -1,0 +1,25 @@
+name: Go backend checks
+
+on:
+  push:
+    branches:
+      - codex/qq-homework-v3-go-backend-hardening-20261023
+  workflow_dispatch:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Go test
+        run: go test ./...
+      - name: Go vet
+        run: go vet ./...
+      - name: Go race tests
+        run: go test -race ./internal/api ./internal/db ./internal/rule ./internal/parser
+      - name: Go build
+        run: go build ./cmd/server

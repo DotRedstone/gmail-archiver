@@ -318,7 +318,7 @@ func (s *Server) handleConfirmPublicationDraft(w http.ResponseWriter, r *http.Re
 		writeJSONError(w, http.StatusServiceUnavailable, "publication is preparing; retry confirmation")
 		return
 	}
-	card, err := s.database.GetLabCardDraft(card.Number)
+	card, err = s.database.GetLabCardDraft(card.Number)
 	if err != nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "publication state unavailable")
 		return
