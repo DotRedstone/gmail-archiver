@@ -547,3 +547,51 @@ func TestSuggestedLabDeadline(t *testing.T) {
 		t.Fatalf("unexpected deadline: %s", deadline)
 	}
 }
+
+
+func TestLabCardUploadRejectsPublishedNumberWithoutLoadedRule(t *testing.T) {
+	root := t.TempDir()
+	database, err := db.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	inject, err := sql.Open("sqlite", filepath.Join(root, "metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inject.Close()
+	if _, err := inject.Exec(`INSERT INTO published_assignments
+		(assignment_id, draft_id, status, created_at) VALUES ('experiment_9', 'D09-old-snapshot', 'ready', ?)`,
+		time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	files, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(&config.Config{APIKey: "synthetic-secret", DataDir: root}, database, files, nil, rule.NewEngine(root)).Routes()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	file, err := writer.CreateFormFile("file", "实验卡9.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("%PDF-1.4\nsynthetic")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v3/lab-cards", &body)
+	req.Header.Set("X-API-Key", "synthetic-secret")
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("existing DB publication without a loaded rule accepted a duplicate draft: %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := database.GetLabCardDraft(9); err != db.ErrNotFound {
+		t.Fatalf("conflicting upload created a draft: %v", err)
+	}
+}

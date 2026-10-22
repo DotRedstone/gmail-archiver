@@ -220,3 +220,9 @@ func (d *DB) RecordPublicationResult(id, platformID, botID, status, messageID, c
 	}
 	return d.GetPublicationJob(id)
 }
+
+func (d *DB) HasPublishedAssignment(assignmentID string) (bool, error) {
+	var exists int
+	err := d.conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM published_assignments WHERE assignment_id=?)`, assignmentID).Scan(&exists)
+	return exists != 0, err
+}

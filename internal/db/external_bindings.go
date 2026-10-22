@@ -208,10 +208,6 @@ func (d *DB) ConfirmMatchingBindingIntent(intent BindingIntent, now time.Time) (
 	if _, err = tx.Exec(`DELETE FROM binding_intents WHERE platform_id=? AND bot_id=? AND external_user_id=?`, platformID, botID, userID); err != nil {
 		return nil, err
 	}
-	expiration, err = time.Parse(time.RFC3339Nano, expires)
-	if err != nil {
-		return nil, err
-	}
 	if !now.Before(expiration) {
 		if err := tx.Commit(); err != nil {
 			return nil, err

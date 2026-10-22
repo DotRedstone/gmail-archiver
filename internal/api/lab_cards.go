@@ -91,8 +91,16 @@ func (s *Server) handleLabCardUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid experiment number")
 		return
 	}
+	assignmentID := fmt.Sprintf("experiment_%d", number)
+	if exists, err := s.database.HasPublishedAssignment(assignmentID); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to check published assignment")
+		return
+	} else if exists {
+		writeJSONError(w, http.StatusConflict, "experiment number already has a draft or assignment")
+		return
+	}
 	if s.rules != nil {
-		if _, exists := s.rules.GetRule(fmt.Sprintf("experiment_%d", number)); exists {
+		if _, exists := s.rules.GetRule(assignmentID); exists {
 			writeJSONError(w, http.StatusConflict, "experiment number already has a draft or assignment")
 			return
 		}
