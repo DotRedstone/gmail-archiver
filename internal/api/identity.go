@@ -113,7 +113,7 @@ func (s *Server) handleGetBindingIntent(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if !time.Now().Before(intent.ExpiresAt) {
-		_ = s.database.CancelBindingIntent(key.PlatformID, key.BotID, key.ExternalUserID)
+		_ = s.database.CancelBindingIntentIfMatches(*intent)
 		writeJSONError(w, http.StatusGone, "binding intent expired")
 		return
 	}
@@ -138,17 +138,17 @@ func (s *Server) handleConfirmBindingIntent(w http.ResponseWriter, r *http.Reque
 		writeJSONError(w, http.StatusInternalServerError, "failed to get binding intent")
 		return
 	}
-	_, ok, rosterErr := s.rosterStudent(intent.StudentID, intent.StudentName)
+	student, ok, rosterErr := s.rosterStudent(intent.StudentID, intent.StudentName)
 	if rosterErr != nil {
 		writeJSONError(w, http.StatusServiceUnavailable, "course roster unavailable")
 		return
 	}
-	if !ok {
-		_ = s.database.CancelBindingIntent(key.PlatformID, key.BotID, key.ExternalUserID)
+	if !ok || student.ClassName != intent.ClassName {
+		_ = s.database.CancelBindingIntentIfMatches(*intent)
 		writeJSONError(w, http.StatusConflict, "student identity no longer matches roster")
 		return
 	}
-	binding, err := s.database.ConfirmBindingIntent(key.PlatformID, key.BotID, key.ExternalUserID, time.Now().UTC())
+	binding, err := s.database.ConfirmMatchingBindingIntent(*intent, time.Now().UTC())
 	switch {
 	case errors.Is(err, db.ErrNotFound):
 		writeJSONError(w, http.StatusNotFound, "no pending binding")

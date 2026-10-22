@@ -159,7 +159,28 @@ func (d *DB) CancelBindingIntent(platformID, botID, userID string) error {
 	return err
 }
 
+// Expiry and roster-drift cleanup must not delete a newer five-minute intent.
+func (d *DB) CancelBindingIntentIfMatches(intent BindingIntent) error {
+	_, err := d.conn.Exec(`DELETE FROM binding_intents WHERE platform_id=? AND bot_id=? AND external_user_id=?
+		AND student_id=? AND student_name=? AND class_name=? AND expires_at=?`,
+		intent.PlatformID, intent.BotID, intent.ExternalUserID, intent.StudentID,
+		intent.StudentName, intent.ClassName, intent.ExpiresAt.UTC().Format(time.RFC3339Nano))
+	return err
+}
+
 func (d *DB) ConfirmBindingIntent(platformID, botID, userID string, now time.Time) (*ExternalBinding, error) {
+	intent, err := d.GetBindingIntent(platformID, botID, userID)
+	if err != nil {
+		return nil, err
+	}
+	return d.ConfirmMatchingBindingIntent(*intent, now)
+}
+
+// ConfirmMatchingBindingIntent atomically consumes only the intent previously
+// checked against the roster. A concurrent replacement must not bind an
+// unchecked student under the same external identity.
+func (d *DB) ConfirmMatchingBindingIntent(intent BindingIntent, now time.Time) (*ExternalBinding, error) {
+	platformID, botID, userID := intent.PlatformID, intent.BotID, intent.ExternalUserID
 	tx, err := d.conn.Begin()
 	if err != nil {
 		return nil, err
@@ -176,10 +197,18 @@ func (d *DB) ConfirmBindingIntent(platformID, botID, userID string, now time.Tim
 	if err != nil {
 		return nil, err
 	}
+	expiration, err := time.Parse(time.RFC3339Nano, expires)
+	if err != nil {
+		return nil, err
+	}
+	if b.StudentID != intent.StudentID || b.StudentName != intent.StudentName ||
+		b.ClassName != intent.ClassName || !expiration.Equal(intent.ExpiresAt) {
+		return nil, ErrBindingConflict
+	}
 	if _, err = tx.Exec(`DELETE FROM binding_intents WHERE platform_id=? AND bot_id=? AND external_user_id=?`, platformID, botID, userID); err != nil {
 		return nil, err
 	}
-	expiration, err := time.Parse(time.RFC3339Nano, expires)
+	expiration, err = time.Parse(time.RFC3339Nano, expires)
 	if err != nil {
 		return nil, err
 	}
