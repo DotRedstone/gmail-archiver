@@ -1,0 +1,16 @@
+result
+data/
+*.db
+*.db-wal
+*.db-shm
+bin/
+cmd/audit_mailbox/
+cmd/diagnose/
+cmd/full_audit/
+cmd/inspect/
+cmd/inspect_body/
+__pycache__/
+*.pyc
+plugin_config.json
+*.sqlite3*
+.env

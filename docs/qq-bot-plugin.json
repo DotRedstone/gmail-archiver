@@ -1,0 +1,9 @@
+{
+  "repository": "astrbot-plugin-gmail-homework",
+  "remote": null,
+  "version": "2.0.0",
+  "revision": "38b2dd8c4762d5fa2b45faff2d9ecefe4e151300",
+  "api_contract": "qq-homework-v2",
+  "backend_revision": "f34a7eece6a37e8800f95cb16d3724dc536c274b",
+  "backend_build_revision": "7c4f159e7958283a59fa834b676cb884c0080a9a"
+}
