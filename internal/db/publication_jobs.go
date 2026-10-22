@@ -206,8 +206,10 @@ func (d *DB) PublishedAssignmentStatus(assignmentID, draftID string) (string, er
 func (d *DB) RecordPublicationResult(id, platformID, botID, status, messageID, category string, now time.Time) (*PublicationJob, error) {
 	result, err := d.conn.Exec(`UPDATE publication_delivery_jobs
 		SET status=?, message_id=?, failure_category=?, updated_at=?
-		WHERE job_id=? AND platform_id=? AND bot_id=? AND status='unknown'`,
-		status, messageID, category, now.UTC().Format(time.RFC3339Nano), id, platformID, botID)
+		WHERE job_id=? AND platform_id=? AND bot_id=? AND status='unknown'
+		AND NOT (status=? AND message_id=? AND failure_category=?)`,
+		status, messageID, category, now.UTC().Format(time.RFC3339Nano),
+		id, platformID, botID, status, messageID, category)
 	if err != nil {
 		return nil, err
 	}

@@ -310,6 +310,17 @@ func TestScopedPublicationDraftJobs(t *testing.T) {
 	if rec := call(http.MethodPost, "/api/v3/publication-jobs/"+noticeJob.JobID+"/result", unknown, "application/json"); rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"failure_category":"timeout"`)) {
 		t.Fatalf("unknown receipt was lost: %d: %s", rec.Code, rec.Body.String())
 	}
+	ambiguousBefore, err := database.GetPublicationJob(noticeJob.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(http.MethodPost, "/api/v3/publication-jobs/"+noticeJob.JobID+"/result", unknown, "application/json"); rec.Code != http.StatusOK {
+		t.Fatalf("identical unknown retry was rejected: %d: %s", rec.Code, rec.Body.String())
+	}
+	ambiguousAfter, err := database.GetPublicationJob(noticeJob.JobID)
+	if err != nil || !ambiguousBefore.UpdatedAt.Equal(ambiguousAfter.UpdatedAt) {
+		t.Fatalf("identical unknown retry mutated the receipt: before=%+v after=%+v err=%v", ambiguousBefore, ambiguousAfter, err)
+	}
 	if rec := call(http.MethodGet, "/api/v3/publication-jobs?platform_id=course-qq&bot_id=bot-example", "", ""); bytes.Contains(rec.Body.Bytes(), []byte(noticeJob.JobID)) {
 		t.Fatalf("unknown delivery was automatically requeued: %s", rec.Body.String())
 	}
