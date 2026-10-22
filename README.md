@@ -5,6 +5,8 @@ Gmail 附件归档与课程作业统计服务。Go 服务通过 IMAP 接收邮�
 QQ 对话、身份权限和 LLM 工具由独立 AstrBot 插件维护。组件边界与版本见 [QQ 对接契约](docs/QQ_BOT_INTEGRATION.md)，安全变化与部署门槛见 [安全审查](docs/SECURITY_REVIEW.md)。
 v3 外部身份接口与旧绑定隔离方式见 [后端契约](docs/QQ_HOMEWORK_V3_API.md)；机器人指令和回复草案位于独立插件项目。
 
+v3 实验卡确认的 `publication_status: ready` 只表示作业规则和名单投影可用，**不是 QQ 群投递成功**。只有对应 `publication-jobs` 的 `sent` 状态及平台 `message_id` 才表示插件报告发送成功；`unknown/interrupted` 必须人工核对，不会自动重发。旧客户端 `manual_pending` 仍走人工发布。
+
 ## 开发与验证
 
 ```sh
