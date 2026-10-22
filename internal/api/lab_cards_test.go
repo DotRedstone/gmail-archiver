@@ -244,6 +244,11 @@ func TestScopedPublicationDraftJobs(t *testing.T) {
 	if result.AssignmentID != "experiment_2" || len(result.Jobs) != 3 {
 		t.Fatalf("wrong jobs: %s", confirmed.Body.String())
 	}
+	for _, job := range result.Jobs {
+		if job.Status != "pending" || job.MessageID != "" {
+			t.Fatalf("assignment creation falsely advertised a QQ delivery: %+v", job)
+		}
+	}
 	if _, ok := rules.GetRule("experiment_2"); !ok {
 		t.Fatal("assignment rule unavailable")
 	}
@@ -405,6 +410,27 @@ func TestPublicationRuleProjectionCanResumeWithoutResending(t *testing.T) {
 	}
 	if rec := call(http.MethodGet, "/api/v3/publication-jobs?platform_id=course-qq&bot_id=bot-example"); rec.Code != http.StatusOK || bytes.Contains(rec.Body.Bytes(), []byte(`"job_id"`)) {
 		t.Fatalf("preparing jobs became sendable: %d: %s", rec.Code, rec.Body.String())
+	}
+	preparingJobs, err := database.ListPublicationJobs(card.DraftID)
+	if err != nil || len(preparingJobs) != 3 {
+		t.Fatalf("preparing must durably own three unavailable jobs: %d %v", len(preparingJobs), err)
+	}
+	var blockedJob string
+	for _, job := range preparingJobs {
+		if job.Kind == "file" {
+			blockedJob = job.JobID
+		}
+	}
+	blockedClaim := httptest.NewRequest(http.MethodPost, "/api/v3/publication-jobs/"+blockedJob+"/claim",
+		bytes.NewBufferString(`{"platform_id":"course-qq","bot_id":"bot-example"}`))
+	blockedClaim.Header.Set("X-API-Key", "synthetic-secret")
+	blockedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(blockedResponse, blockedClaim)
+	if blockedResponse.Code != http.StatusServiceUnavailable {
+		t.Fatalf("preparing job was claimable: %d: %s", blockedResponse.Code, blockedResponse.Body.String())
+	}
+	if state, err := database.GetPublicationJob(blockedJob); err != nil || state.Status != "pending" {
+		t.Fatalf("rejected preparing claim changed state: %+v %v", state, err)
 	}
 	if err := os.Remove(blockedRules); err != nil {
 		t.Fatal(err)
